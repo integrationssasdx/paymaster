@@ -8,7 +8,7 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 
 ## 状态
 
-已实现 ERC-4337 v0.7 UserOperation 静态校验，作为后续 Gas 代付与打包的公共入口。本次不验签、不估算成本、不模拟链上执行、不落盘。
+已实现 ERC-4337 v0.7 UserOperation 静态校验，作为后续 Gas 代付与打包的公共入口；并在其之上提供纯静态 Gas 代付决策 `evaluate_sponsorship`。本次不验签、不估算链上成本、不模拟链上执行、不落盘。
 
 ## 用法
 
@@ -16,8 +16,12 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 
 ```python
 from paymaster.validation import validate
+from paymaster.sponsorship import evaluate_sponsorship
 
 result = validate(request)  # request 为已解析的 JSON 值，只返回字典，不抛业务异常
+
+# request 先过 validate；policy 为已解析的 JSON 值，不修改入参
+result = evaluate_sponsorship(request, policy)
 ```
 
 命令行（从标准输入读 JSON，只向标准输出写一个 JSON 文档；成功退出 0，失败退出 1）：
@@ -46,6 +50,22 @@ python -m paymaster.validate < request.json
 - 失败：`{"ok": false, "error": {"code", "path", "message"}}`，`code` 为稳定错误码，`path` 为 JSON Pointer（RFC 6901）。
 
 错误码：`E_UNKNOWN_FIELD`（未知键）、`E_MISSING_FIELD`（缺字段）、`E_INVALID_FIELD`（值非法）、`E_UNSUPPORTED_VERSION`（版本不支持）、`E_INVALID_JSON`（JSON 根错误）、`E_FIELD_COMBINATION`（字段配对错误）。
+
+### Gas 代付决策
+
+`evaluate_sponsorship(request, policy)` 先对 `request` 走上述校验，非法值、字段或组合原样返回既有错误，不判断代付；随后结构性校验 `policy`。
+
+- `policy` 恰好含 `budgetWei`、`maxTotalGas` 两个键，均为规范 quantity 且大于 0。
+- 检查顺序：根类型 → 必需键（缺键先于未知键）→ 未知键 → 值（依次 `budgetWei`、`maxTotalGas`）。
+- policy 错误码：`E_POLICY_INVALID_FIELD`（根非对象或值非法）、`E_POLICY_MISSING_FIELD`（缺键）、`E_POLICY_UNKNOWN_FIELD`（未知键）；根错误 `path` 为空，字段错误 `path` 指向该键。
+
+校验通过后：`totalGas` 为 `callGasLimit + verificationGasLimit + preVerificationGas` 加可选的 `paymasterVerificationGasLimit`、`paymasterPostOpGasLimit` 的整数和；`estimatedCostWei` 为 `totalGas × maxFeePerGas` 的整数积。
+
+- `totalGas > maxTotalGas`：`approved` false，`reason` `E_GAS_LIMIT`；
+- 否则 `estimatedCostWei > budgetWei`：`approved` false，`reason` `E_BUDGET`；
+- 其余：`approved` true，`reason` `OK`。
+
+request 或 policy 结构性失败返回 `{"ok": false, "error": {"code", "path", "message"}}`；其他结果返回 `{"ok": true, "decision": {"approved", "reason", "totalGas", "estimatedCostWei"}}`，其中两个数值为十进制字符串。
 
 ## 测试
 
