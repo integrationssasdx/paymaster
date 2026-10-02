@@ -8,7 +8,7 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 
 ## 状态
 
-已实现 ERC-4337 v0.7 UserOperation 静态校验，作为后续 Gas 代付与打包的公共入口。本次不验签、不估算成本、不模拟链上执行、不落盘。
+已实现 ERC-4337 v0.7 UserOperation 静态校验，并在此基线上提供 Gas 代付决策。不验签、不模拟链上执行、不访问外部系统、不落盘。
 
 ## 用法
 
@@ -16,14 +16,17 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 
 ```python
 from paymaster.validation import validate
+from paymaster.sponsorship import evaluate_sponsorship
 
 result = validate(request)  # request 为已解析的 JSON 值，只返回字典，不抛业务异常
+decision = evaluate_sponsorship(request, policy)  # 先走 validate，再评估代付
 ```
 
-命令行（从标准输入读 JSON，只向标准输出写一个 JSON 文档；成功退出 0，失败退出 1）：
+命令行（从标准输入读 JSON，只向标准输出写一个 JSON 文档；结果 `ok` 为 true 退出 0，否则退出 1）：
 
 ```sh
 python -m paymaster.validate < request.json
+python -m paymaster.sponsor < sponsorship.json  # {"request": ..., "policy": ...}
 ```
 
 ### 请求格式
@@ -46,6 +49,20 @@ python -m paymaster.validate < request.json
 - 失败：`{"ok": false, "error": {"code", "path", "message"}}`，`code` 为稳定错误码，`path` 为 JSON Pointer（RFC 6901）。
 
 错误码：`E_UNKNOWN_FIELD`（未知键）、`E_MISSING_FIELD`（缺字段）、`E_INVALID_FIELD`（值非法）、`E_UNSUPPORTED_VERSION`（版本不支持）、`E_INVALID_JSON`（JSON 根错误）、`E_FIELD_COMBINATION`（字段配对错误）。
+
+### 代付决策
+
+`evaluate_sponsorship(request, policy)` 先用上述规则校验 `request`，失败则原样返回既有错误、不判断代付；随后校验 `policy`：
+
+- `policy` 恰好含 `budgetWei` 与 `maxTotalGas` 两个键，均为规范 quantity 且大于 0。检查顺序：根类型、必需键、未知键、字段值（`budgetWei` 先于 `maxTotalGas`；缺键先于未知键）。
+- policy 错误码：`E_POLICY_INVALID_FIELD`（根非对象或值非法）、`E_POLICY_MISSING_FIELD`（缺键）、`E_POLICY_UNKNOWN_FIELD`（未知键）。根 path 为空，字段 path 指向键。
+
+校验通过后：`totalGas` 为 `callGasLimit`、`verificationGasLimit`、`preVerificationGas` 与可选 `paymasterVerificationGasLimit`、`paymasterPostOpGasLimit` 的整数和；`estimatedCostWei` 为 `totalGas` 乘 `maxFeePerGas`。`totalGas` 大于 `maxTotalGas` 时 `approved` 为 false、`reason` 为 `E_GAS_LIMIT`；否则 `estimatedCostWei` 大于 `budgetWei` 时 `approved` 为 false、`reason` 为 `E_BUDGET`；其余 `approved` 为 true、`reason` 为 `OK`。
+
+结果格式：
+
+- 结构失败：`{"ok": false, "error": {"code", "path", "message"}}`。
+- 其他结果：`{"ok": true, "decision": {"approved", "reason", "totalGas", "estimatedCostWei"}}`，`totalGas` 与 `estimatedCostWei` 为十进制字符串。
 
 ## 测试
 
