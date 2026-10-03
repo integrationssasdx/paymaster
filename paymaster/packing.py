@@ -1,8 +1,10 @@
 """ERC-4337 v0.7 批量打包规划。
 
-公开入口 ``plan_bundle(document)`` 与 ``plan_bundle_cost_first(document)``：
+公开入口 ``plan_bundle(document)``、``plan_bundle_cost_first(document)``、
+``plan_bundle_max_count(document)`` 与 ``plan_bundle_sender_fair(document)``：
 
-- 入参为已解析的 JSON 值，函数不修改入参。``document`` 恰好含三个键：
+- 入参为已解析的 JSON 值，函数不修改入参。前三个入口的 ``document`` 恰好含
+  三个键：
   - ``requests``：数组，元素为 ``paymaster.validation.validate`` 接受的请求；
   - ``sponsorshipPolicy``：代付策略，规则与 ``paymaster.sponsorship`` 的单笔
     策略相同（``budgetWei``、``maxTotalGas``）；
@@ -40,6 +42,17 @@ approved 项不再按顺序贪心，而是在 ``maxTotalGas`` 与 ``maxCostWei``
 确定后，未入选的 approved 请求单独并入该组：先使总 gas 超限记
 ``E_BUNDLE_GAS``，否则（使总成本超限）记 ``E_BUNDLE_BUDGET``。
 
+``plan_bundle_sender_fair`` 沿用同类文档结构、校验次序、错误码与结果结构，但
+文档恰好含 ``requests``、``sponsorshipPolicy``、``bundlePolicy``、
+``fairnessPolicy`` 四个键；``fairnessPolicy`` 恰好含 ``maxPerSender``，为规范
+quantity 且大于 0，限制每个 sender 的入选数量。approved 项在 sender 配额与
+``maxTotalGas``、``maxCostWei`` 两条限额下全局择优：先最大化入选数量，再最大
+化不同 sender 数，之后依次取总 ``totalGas`` 较小、总 ``estimatedCostWei`` 较
+小、``selected`` 下标序列字典序较小的唯一方案。方案确定后，未入选的 approved
+请求只记一个原因：其 sender 在方案中已满配额记 ``E_SENDER_QUOTA``；否则并入后
+先使总 gas 超限记 ``E_BUNDLE_GAS``，不先超 gas 但使总成本超限记
+``E_BUNDLE_BUDGET``。空 requests、无入选或同 sender 部分入选均为成功结果。
+
 本模块不验签、不模拟执行、不访问节点、数据库或文件。
 """
 
@@ -67,12 +80,24 @@ from paymaster.validation import (
 
 REASON_BUNDLE_GAS = "E_BUNDLE_GAS"
 REASON_BUNDLE_BUDGET = "E_BUNDLE_BUDGET"
+REASON_SENDER_QUOTA = "E_SENDER_QUOTA"
 
 # 根对象的必需键，顺序即缺键检查顺序。
 _ROOT_FIELDS = ("requests", "sponsorshipPolicy", "bundlePolicy")
 
+# sender 公平文档的根对象必需键，顺序即缺键检查顺序。
+_ROOT_FIELDS_SENDER_FAIR = (
+    "requests",
+    "sponsorshipPolicy",
+    "bundlePolicy",
+    "fairnessPolicy",
+)
+
 # bundlePolicy 的必需键，顺序即检查顺序（缺键与字段值均按此顺序报错）。
 _BUNDLE_POLICY_FIELDS = ("maxTotalGas", "maxCostWei")
+
+# fairnessPolicy 的必需键，顺序即检查顺序。
+_FAIRNESS_POLICY_FIELDS = ("maxPerSender",)
 
 
 def _error(code: str, path: str, message: str) -> dict[str, Any]:
@@ -132,27 +157,24 @@ def _validate_policy(
     return normalized, None
 
 
-def _prepare(
-    document: Any,
-) -> tuple[list[Any], Any, int, int] | dict[str, Any]:
-    """校验文档并返回 (requests, sponsorshipPolicy, maxTotalGas, maxCostWei)。
-
-    校验失败时返回错误字典（``ok`` 为 False）。校验次序：根类型、未知键、
-    缺键、requests（逐项）、sponsorshipPolicy、bundlePolicy。
-    """
+def _check_root(document: Any, root_fields: tuple[str, ...]) -> dict[str, Any] | None:
+    """校验根对象：类型、未知键、缺键。通过返回 None，否则返回错误字典。"""
     if not isinstance(document, dict):
         return _error(E_INVALID_JSON, "", "document root must be a JSON object")
 
     for key in document:
-        if key not in _ROOT_FIELDS:
+        if key not in root_fields:
             return _error(E_UNKNOWN_FIELD, _pointer(key), f"unknown field {key!r}")
-    for key in _ROOT_FIELDS:
+    for key in root_fields:
         if key not in document:
             return _error(
                 E_MISSING_FIELD, _pointer(key), f"missing required field {key!r}"
             )
+    return None
 
-    requests = document["requests"]
+
+def _check_requests(requests: Any) -> dict[str, Any] | None:
+    """逐项校验 requests，通过返回 None，否则返回错误字典。"""
     if not isinstance(requests, list):
         return _error(
             E_INVALID_FIELD, _pointer("requests"), "field 'requests' must be an array"
@@ -167,6 +189,24 @@ def _prepare(
                 _pointer("requests", str(index)) + error["path"],
                 error["message"],
             )
+    return None
+
+
+def _prepare(
+    document: Any,
+) -> tuple[list[Any], Any, int, int] | dict[str, Any]:
+    """校验文档并返回 (requests, sponsorshipPolicy, maxTotalGas, maxCostWei)。
+
+    校验失败时返回错误字典（``ok`` 为 False）。校验次序：根类型、未知键、
+    缺键、requests（逐项）、sponsorshipPolicy、bundlePolicy。
+    """
+    err = _check_root(document, _ROOT_FIELDS)
+    if err is not None:
+        return err
+
+    err = _check_requests(document["requests"])
+    if err is not None:
+        return err
 
     sponsorship_policy, err = _validate_policy(
         document["sponsorshipPolicy"], _POLICY_FIELDS, "sponsorshipPolicy"
@@ -182,10 +222,55 @@ def _prepare(
     assert sponsorship_policy is not None and bundle_policy is not None
 
     return (
-        requests,
+        document["requests"],
         document["sponsorshipPolicy"],
         int(bundle_policy["maxTotalGas"], 16),
         int(bundle_policy["maxCostWei"], 16),
+    )
+
+
+def _prepare_sender_fair(
+    document: Any,
+) -> tuple[list[Any], Any, int, int, int] | dict[str, Any]:
+    """校验文档并返回 (requests, sponsorshipPolicy, maxTotalGas, maxCostWei, maxPerSender)。
+
+    校验失败时返回错误字典（``ok`` 为 False）。校验次序：根类型、未知键、
+    缺键、requests（逐项）、sponsorshipPolicy、bundlePolicy、fairnessPolicy。
+    """
+    err = _check_root(document, _ROOT_FIELDS_SENDER_FAIR)
+    if err is not None:
+        return err
+
+    err = _check_requests(document["requests"])
+    if err is not None:
+        return err
+
+    sponsorship_policy, err = _validate_policy(
+        document["sponsorshipPolicy"], _POLICY_FIELDS, "sponsorshipPolicy"
+    )
+    if err is not None:
+        return err
+
+    bundle_policy, err = _validate_policy(
+        document["bundlePolicy"], _BUNDLE_POLICY_FIELDS, "bundlePolicy"
+    )
+    if err is not None:
+        return err
+
+    fairness_policy, err = _validate_policy(
+        document["fairnessPolicy"], _FAIRNESS_POLICY_FIELDS, "fairnessPolicy"
+    )
+    if err is not None:
+        return err
+    assert sponsorship_policy is not None and bundle_policy is not None
+    assert fairness_policy is not None
+
+    return (
+        document["requests"],
+        document["sponsorshipPolicy"],
+        int(bundle_policy["maxTotalGas"], 16),
+        int(bundle_policy["maxCostWei"], 16),
+        int(fairness_policy["maxPerSender"], 16),
     )
 
 
@@ -404,5 +489,192 @@ def plan_bundle_max_count(document: Any) -> dict[str, Any]:
         else:
             # chosen 已达最大可行数量，该项并入不可能两条限额都不超。
             skipped.append({"index": indices[item], "reason": REASON_BUNDLE_BUDGET})
+
+    return _plan_result(selected, skipped, decisions)
+
+
+def _pareto_insert(
+    points: list[tuple[int, int, tuple[int, ...]]],
+    gas: int,
+    cost: int,
+    items: tuple[int, ...],
+) -> list[tuple[int, int, tuple[int, ...]]]:
+    """向 Pareto 前沿插入 (gas, cost, items) 并返回新前沿。
+
+    被新点严格支配的旧点被移除；任一旧点不劣于新点（gas 与 cost 都不更大，
+    同 (gas, cost) 时序号元组字典序不更大）时新点被丢弃。同 (gas, cost) 只
+    保留字典序最小的序号元组。
+    """
+    surviving: list[tuple[int, int, tuple[int, ...]]] = []
+    dominated = False
+    for old_gas, old_cost, old_items in points:
+        if gas < old_gas and cost <= old_cost:
+            continue  # 新点严格支配旧点（gas 维）
+        if gas <= old_gas and cost < old_cost:
+            continue  # 新点严格支配旧点（cost 维）
+        if gas == old_gas and cost == old_cost:
+            if items < old_items:
+                continue  # 同限额下序号字典序更小，替换旧点
+            dominated = True
+            surviving.append((old_gas, old_cost, old_items))
+            continue
+        if old_gas <= gas and old_cost <= cost:
+            dominated = True  # 旧点不劣于新点
+        surviving.append((old_gas, old_cost, old_items))
+    if not dominated:
+        surviving.append((gas, cost, items))
+    return surviving
+
+
+def _sender_frontier(
+    items: list[tuple[int, int, int]],
+    quota: int,
+    max_total_gas: int,
+    max_cost_wei: int,
+) -> list[list[tuple[int, int, tuple[int, ...]]]]:
+    """单个 sender 的候选子集前沿。
+
+    ``items`` 为该 sender 的 ``(gas, cost, 候选序号)`` 列表（候选序号递增），
+    返回按选取数量 0..min(quota, len(items)) 索引的 Pareto 前沿列表；超出两
+    条限额的点直接丢弃（累计只会更大，不可能回到可行域）。
+    """
+    cap = min(quota, len(items))
+    dp: list[list[tuple[int, int, tuple[int, ...]]]] = [
+        [] for _ in range(cap + 1)
+    ]
+    dp[0] = [(0, 0, ())]
+    for position, (item_gas, item_cost, candidate) in enumerate(items):
+        for k in range(min(position, cap - 1), -1, -1):
+            for gas, cost, chosen in dp[k]:
+                new_gas = gas + item_gas
+                new_cost = cost + item_cost
+                if new_gas > max_total_gas or new_cost > max_cost_wei:
+                    continue
+                dp[k + 1] = _pareto_insert(
+                    dp[k + 1], new_gas, new_cost, chosen + (candidate,)
+                )
+    return dp
+
+
+def _choose_sender_fair(
+    groups: list[list[tuple[int, int, int]]],
+    quota: int,
+    max_total_gas: int,
+    max_cost_wei: int,
+) -> tuple[tuple[int, ...], int, int]:
+    """在 sender 配额与两条限额下求最优入选方案。
+
+    ``groups`` 为按 sender 首现顺序排列的候选分组，每个候选为
+    ``(gas, cost, 候选序号)``，组内候选序号递增。返回 ``(入选候选序号元组,
+    总gas, 总成本)``。目标依次：入选数量最大、不同 sender 数最大、总 gas
+    最小、总成本最小、候选序号元组字典序最小。
+    """
+    # 逐 sender 分组的二维 DP：dp[(数量, sender数)] 保存该状态下互不支配的
+    # (总gas, 总成本, 候选序号元组) 前沿。同一状态的序号元组等长，等长递增
+    # 元组并入同一集合后字典序关系保持（逐阈值计数差不变），故同 (gas, cost)
+    # 只留字典序最小者不会丢失最优解。
+    dp: dict[tuple[int, int], list[tuple[int, int, tuple[int, ...]]]] = {
+        (0, 0): [(0, 0, ())]
+    }
+    for group in groups:
+        frontier = _sender_frontier(group, quota, max_total_gas, max_cost_wei)
+        next_dp = {key: list(points) for key, points in dp.items()}
+        for (count, senders), points in dp.items():
+            for take in range(1, len(frontier)):
+                key = (count + take, senders + 1)
+                target = next_dp.setdefault(key, [])
+                for gas, cost, chosen in points:
+                    for add_gas, add_cost, add_items in frontier[take]:
+                        new_gas = gas + add_gas
+                        new_cost = cost + add_cost
+                        if new_gas > max_total_gas or new_cost > max_cost_wei:
+                            continue
+                        target = _pareto_insert(
+                            target,
+                            new_gas,
+                            new_cost,
+                            tuple(sorted(chosen + add_items)),
+                        )
+                next_dp[key] = target
+        dp = next_dp
+
+    best_rank: tuple[int, int, int, int, tuple[int, ...]] | None = None
+    best: tuple[tuple[int, ...], int, int] = ((), 0, 0)
+    for (count, senders), points in dp.items():
+        for gas, cost, chosen in points:
+            rank = (-count, -senders, gas, cost, chosen)
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best = (chosen, gas, cost)
+    return best
+
+
+def plan_bundle_sender_fair(document: Any) -> dict[str, Any]:
+    """按 sender 公平约束的批量打包规划。
+
+    文档恰好含 ``requests``、``sponsorshipPolicy``、``bundlePolicy``、
+    ``fairnessPolicy`` 四个键；``fairnessPolicy.maxPerSender`` 限制每个
+    sender 的入选数量。approved 请求在配额与两条 bundle 限额下全局择优：先
+    最大化入选数量，再最大化不同 sender 数，之后依次取总 ``totalGas`` 较
+    小、总 ``estimatedCostWei`` 较小、下标序列字典序较小的唯一方案。未入
+    选的 approved 请求：sender 已满配额记 ``E_SENDER_QUOTA``，否则并入后先
+    超 gas 记 ``E_BUNDLE_GAS``，不先超 gas 但超成本记 ``E_BUNDLE_BUDGET``。
+    只返回字典，不抛业务异常。
+    """
+    prepared = _prepare_sender_fair(document)
+    if isinstance(prepared, dict):
+        return prepared
+    (
+        requests,
+        sponsorship_policy,
+        max_total_gas,
+        max_cost_wei,
+        max_per_sender,
+    ) = prepared
+
+    decisions = _evaluate_all(requests, sponsorship_policy)
+
+    skipped: list[dict[str, Any]] = []
+    # candidates 按原下标递增压入（候选序号与原下标顺序同构）；groups 按
+    # sender 首现顺序分组，组内候选序号递增。sender 已经 validate 规范化为小
+    # 写，这里再小写一次仅为防御性分组。
+    candidates: list[tuple[int, int, str, int]] = []
+    groups: list[list[tuple[int, int, int]]] = []
+    group_by_sender: dict[str, list[tuple[int, int, int]]] = {}
+    for index, (request, decision) in enumerate(zip(requests, decisions)):
+        if not decision["approved"]:
+            skipped.append({"index": index, "reason": decision["reason"]})
+            continue
+        sender = request["userOperation"]["sender"].lower()
+        candidate = len(candidates)
+        item_gas = int(decision["totalGas"])
+        item_cost = int(decision["estimatedCostWei"])
+        candidates.append((item_gas, item_cost, sender, index))
+        group = group_by_sender.setdefault(sender, [])
+        if not group:
+            groups.append(group)
+        group.append((item_gas, item_cost, candidate))
+
+    chosen, chosen_gas, _ = _choose_sender_fair(
+        groups, max_per_sender, max_total_gas, max_cost_wei
+    )
+
+    chosen_set = set(chosen)
+    selected = [candidates[candidate][3] for candidate in chosen]
+    sender_used: dict[str, int] = {}
+    for candidate in chosen:
+        sender = candidates[candidate][2]
+        sender_used[sender] = sender_used.get(sender, 0) + 1
+    for candidate, (item_gas, _, sender, index) in enumerate(candidates):
+        if candidate in chosen_set:
+            continue
+        if sender_used.get(sender, 0) >= max_per_sender:
+            reason = REASON_SENDER_QUOTA
+        elif chosen_gas + item_gas > max_total_gas:
+            reason = REASON_BUNDLE_GAS
+        else:
+            # chosen 已达最大可行数量，配额与 gas 都允许时该项并入必然超成本。
+            reason = REASON_BUNDLE_BUDGET
+        skipped.append({"index": index, "reason": reason})
 
     return _plan_result(selected, skipped, decisions)

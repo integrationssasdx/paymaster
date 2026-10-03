@@ -10,12 +10,15 @@
 - `paymaster.packing.plan_bundle_cost_first(document)` 成本优先的批量打包规划。
 - `paymaster.packing.plan_bundle_max_count(document)` 以入选数量最大化为目标的
   批量打包规划。
+- `paymaster.packing.plan_bundle_sender_fair(document)` 按 sender 公平约束的
+  批量打包规划。
 """
 
 from paymaster.packing import (
     plan_bundle,
     plan_bundle_cost_first,
     plan_bundle_max_count,
+    plan_bundle_sender_fair,
 )
 from paymaster.sponsorship import evaluate_sponsorship
 from paymaster.validation import validate
@@ -26,5 +29,6 @@ __all__ = [
     "plan_bundle",
     "plan_bundle_cost_first",
     "plan_bundle_max_count",
+    "plan_bundle_sender_fair",
 ]
 __version__ = "0.1.0"
