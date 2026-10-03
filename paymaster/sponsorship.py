@@ -45,22 +45,28 @@ REASON_BUDGET = "E_BUDGET"
 # policy 的必需键，顺序即检查顺序（缺键与字段值均按此顺序报错）。
 _POLICY_FIELDS = ("budgetWei", "maxTotalGas")
 
+# policy 根对象在错误信息中的称呼（打包文档中的各策略沿用同一称呼）。
+_ROOT_LABEL = "policy"
+
 
 def _error(code: str, path: str, message: str) -> dict[str, Any]:
     return {"ok": False, "error": {"code": code, "path": path, "message": message}}
 
 
-def _validate_policy(policy: Any) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
-    """校验代付策略，返回 (规范化字段字典, None) 或 (None, 错误字典)。
+def _validate_policy_fields(
+    policy: Any, fields: tuple[str, ...], *, root_label: str = _ROOT_LABEL
+) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """校验一个恰好含给定键的 quantity 策略。
 
-    检查顺序：根类型、必需键、未知键、字段值（budgetWei 先于 maxTotalGas）。
+    返回 (规范化字段字典, None) 或 (None, 错误字典)。检查顺序：根类型、
+    必需键（按 ``fields`` 顺序）、未知键、字段值（同序，先于未知键的是缺键）。
     """
     if not isinstance(policy, dict):
         return None, _error(
-            E_POLICY_INVALID_FIELD, "", "policy must be an object"
+            E_POLICY_INVALID_FIELD, "", f"{root_label} must be an object"
         )
 
-    for name in _POLICY_FIELDS:
+    for name in fields:
         if name not in policy:
             return None, _error(
                 E_POLICY_MISSING_FIELD,
@@ -69,13 +75,13 @@ def _validate_policy(policy: Any) -> tuple[dict[str, str] | None, dict[str, Any]
             )
 
     for key in policy:
-        if key not in _POLICY_FIELDS:
+        if key not in fields:
             return None, _error(
                 E_POLICY_UNKNOWN_FIELD, _pointer(key), f"unknown field {key!r}"
             )
 
     normalized: dict[str, str] = {}
-    for name in _POLICY_FIELDS:
+    for name in fields:
         value = policy[name]
         if (
             not isinstance(value, str)
@@ -95,6 +101,11 @@ def _validate_policy(policy: Any) -> tuple[dict[str, str] | None, dict[str, Any]
             )
         normalized[name] = value.lower()
     return normalized, None
+
+
+def _validate_policy(policy: Any) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """校验代付策略，返回 (规范化字段字典, None) 或 (None, 错误字典)。"""
+    return _validate_policy_fields(policy, _POLICY_FIELDS)
 
 
 def evaluate_sponsorship(request: Any, policy: Any) -> dict[str, Any]:

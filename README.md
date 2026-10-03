@@ -8,7 +8,7 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 
 ## 状态
 
-已实现 ERC-4337 v0.7 UserOperation 静态校验，并在此基线上提供 Gas 代付决策。不验签、不模拟链上执行、不访问外部系统、不落盘。
+已实现 ERC-4337 v0.7 UserOperation 静态校验，并在此基线上提供 Gas 代付决策与批量打包规划。不验签、不模拟链上执行、不访问外部系统、不落盘。
 
 ## 用法
 
@@ -17,9 +17,11 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 ```python
 from paymaster.validation import validate
 from paymaster.sponsorship import evaluate_sponsorship
+from paymaster.packing import plan_bundle
 
 result = validate(request)  # request 为已解析的 JSON 值，只返回字典，不抛业务异常
 decision = evaluate_sponsorship(request, policy)  # 先走 validate，再评估代付
+plan = plan_bundle(document)  # 对批量代付文档逐项校验并按顺序规划打包
 ```
 
 命令行（从标准输入读 JSON，只向标准输出写一个 JSON 文档；结果 `ok` 为 true 退出 0，否则退出 1）：
@@ -27,6 +29,7 @@ decision = evaluate_sponsorship(request, policy)  # 先走 validate，再评估�
 ```sh
 python -m paymaster.validate < request.json
 python -m paymaster.sponsor < sponsorship.json  # {"request": ..., "policy": ...}
+python -m paymaster.pack < bundle.json  # {"requests": [...], "sponsorshipPolicy": ..., "bundlePolicy": ...}
 ```
 
 ### 请求格式
@@ -63,6 +66,32 @@ python -m paymaster.sponsor < sponsorship.json  # {"request": ..., "policy": ...
 
 - 结构失败：`{"ok": false, "error": {"code", "path", "message"}}`。
 - 其他结果：`{"ok": true, "decision": {"approved", "reason", "totalGas", "estimatedCostWei"}}`，`totalGas` 与 `estimatedCostWei` 为十进制字符串。
+
+### 批量打包
+
+`plan_bundle(document)` 的根恰好含 `requests`、`sponsorshipPolicy`、`bundlePolicy` 三个键。
+
+- `requests`：现有单笔代付请求组成的数组，逐项先走上述静态校验，再用 `sponsorshipPolicy` 套用单笔代付规则。
+- `sponsorshipPolicy`：同单笔 `policy`，恰好含 `budgetWei`、`maxTotalGas`，均为规范 quantity 且大于 0。
+- `bundlePolicy`：恰好含 `maxTotalGas`、`maxCostWei`，均为规范 quantity 且大于 0。
+
+结构检查次序：根类型、未知键、缺键、`requests`（逐项，按下标顺序）、策略（先 `sponsorshipPolicy` 后 `bundlePolicy`）；策略内部为根类型、缺键、未知键、字段值。
+
+- 请求结构错误原样保留 `code`、`message`，`path` 前加 `/requests/<下标>`（如 `/requests/0/userOperation/signature`）。
+- 策略结构错误使用 `E_POLICY_INVALID_FIELD`、`E_POLICY_MISSING_FIELD`、`E_POLICY_UNKNOWN_FIELD`，根 `path` 为空，字段 `path` 指向该键。
+- `requests` 不是数组时为 `E_INVALID_FIELD`，`path` 为 `/requests`。
+
+结构通过后严格按 `requests` 顺序贪心决定：
+
+- `approved` 为 false 的请求跳过并沿用单笔 `reason`（`E_GAS_LIMIT`/`E_BUDGET`）。
+- `approved` 项：先把其 `totalGas` 计入累计值，若超过 `bundlePolicy.maxTotalGas` 则不入选、记 `E_BUNDLE_GAS`；否则再把 `estimatedCostWei` 计入，若超过 `bundlePolicy.maxCostWei` 则不入选、记 `E_BUNDLE_BUDGET`（gas 先于成本）；边界相等时入选。一旦某项超限被跳过，后续请求继续按序尝试，不回填、不重排。
+
+结果格式：
+
+- 结构失败：`{"ok": false, "error": {"code", "path", "message"}}`。
+- 其他结果（含空选择与全部跳过）：`{"ok": true, "plan": {"selected", "skipped", "operationCount", "totalGas", "estimatedCostWei"}}`；`selected` 为入选项下标的数组，`skipped` 每项含 `index` 与 `reason`，`operationCount`、`totalGas`、`estimatedCostWei` 为十进制字符串。
+
+`python -m paymaster.pack` 从标准输入读取该文档：JSON 解析失败用 `E_INVALID_JSON`（`path` 为空）；任意结构失败退出 1；其余（`ok` 为 true，含空选择）退出 0，标准输出为且仅为一个 JSON 文档。
 
 ## 测试
 
