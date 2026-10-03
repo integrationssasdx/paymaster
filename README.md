@@ -17,11 +17,12 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 ```python
 from paymaster.validation import validate
 from paymaster.sponsorship import evaluate_sponsorship
-from paymaster.packing import plan_bundle
+from paymaster.packing import plan_bundle, plan_bundle_max_count
 
 result = validate(request)  # request 为已解析的 JSON 值，只返回字典，不抛业务异常
 decision = evaluate_sponsorship(request, policy)  # 先走 validate，再评估代付
 plan = plan_bundle(document)  # 逐项评估代付，再按 bundlePolicy 限额入选
+plan = plan_bundle_max_count(document)  # 在两条限额下最大化入选数量
 ```
 
 命令行（从标准输入读 JSON，只向标准输出写一个 JSON 文档；结果 `ok` 为 true 退出 0，否则退出 1）：
@@ -30,6 +31,8 @@ plan = plan_bundle(document)  # 逐项评估代付，再按 bundlePolicy 限额�
 python -m paymaster.validate < request.json
 python -m paymaster.sponsor < sponsorship.json  # {"request": ..., "policy": ...}
 python -m paymaster.pack < bundle.json  # {"requests": [...], "sponsorshipPolicy": ..., "bundlePolicy": ...}
+python -m paymaster.pack_cost_first < bundle.json  # 成本优先打包
+python -m paymaster.pack_max_count < bundle.json  # 入选数量最大化打包
 ```
 
 ### 请求格式
@@ -79,6 +82,10 @@ python -m paymaster.pack < bundle.json  # {"requests": [...], "sponsorshipPolicy
 
 - 结构失败：`{"ok": false, "error": {"code", "path", "message"}}`。
 - 其他结果：`{"ok": true, "plan": {"selected", "skipped", "operationCount", "totalGas", "estimatedCostWei"}}`，`selected` 为下标数组，`skipped` 元素含 `index` 与 `reason`，`operationCount`、`totalGas`、`estimatedCostWei` 为十进制字符串。
+
+`plan_bundle_cost_first(document)` 使用相同的文档结构、校验次序、错误码与结果结构，但 approved 项按 `estimatedCostWei` 升序、`totalGas` 升序、原下标升序排列后逐项贪心入选，被拒项不阻断后续较小请求。
+
+`plan_bundle_max_count(document)` 同样沿用文档结构、校验次序、错误码与结果结构，但在 approved 请求上求满足两条 bundle 限额的**入选数量最大**子集（二维 0/1 背包）。数量并列时依次取总 `totalGas` 较小、总 `estimatedCostWei` 较小、`selected` 下标序列字典序较小的唯一方案。最终方案确定后，每个未入选的 approved 请求单独并入该组：先使总 gas 超限记 `E_BUNDLE_GAS`，否则（使总成本超限）记 `E_BUNDLE_BUDGET`；不存在两条限额都不超却未入选的请求。`approved` 为 false 的请求不参与选择，按原 index 在 `skipped` 中保留 `E_GAS_LIMIT` 或 `E_BUDGET`。`requests` 为空或最终无入选也是成功结果。命令行为 `python -m paymaster.pack_max_count`，标准输入输出与退出码约定同上。
 
 ## 测试
 

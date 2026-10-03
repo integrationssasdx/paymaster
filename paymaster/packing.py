@@ -33,6 +33,13 @@
 后续较小请求仍可使用剩余额度。``selected`` 与 ``skipped`` 均按原下标升序
 输出。
 
+``plan_bundle_max_count`` 同样沿用文档结构、校验次序、错误码与结果结构，但
+approved 项不再按顺序贪心，而是在 ``maxTotalGas`` 与 ``maxCostWei`` 两条限额
+下求入选数量最大的子集。数量并列时依次取总 ``totalGas`` 较小、总
+``estimatedCostWei`` 较小、``selected`` 下标序列字典序较小的唯一方案。方案
+确定后，未入选的 approved 请求单独并入该组：先使总 gas 超限记
+``E_BUNDLE_GAS``，否则（使总成本超限）记 ``E_BUNDLE_BUDGET``。
+
 本模块不验签、不模拟执行、不访问节点、数据库或文件。
 """
 
@@ -292,5 +299,110 @@ def plan_bundle_cost_first(document: Any) -> dict[str, Any]:
         selected.append(index)
         total_gas += item_gas
         total_cost_wei += item_cost_wei
+
+    return _plan_result(selected, skipped, decisions)
+
+
+def _choose_max_count(
+    candidates: list[tuple[int, int]], max_total_gas: int, max_cost_wei: int
+) -> tuple[tuple[int, ...], int, int]:
+    """在两条限额下求入选数量最大的子集。
+
+    ``candidates`` 为按原下标递增排列的 ``(gas, cost)`` 列表，返回
+    ``(入选候选序号元组, 总gas, 总成本)``。数量并列时依次取总 gas 较小、总
+    cost 较小、候选序号字典序较小的唯一方案。
+    """
+    n = len(candidates)
+
+    # 二维 0/1 背包的 Pareto 前沿 DP：dp[k] 保存恰好选 k 个候选时互不支配的
+    # (总gas, 总成本, 候选序号元组) 列表。同 (gas, cost) 只保留字典序最小的
+    # 序号元组；后续候选的序号都更大，接入后字典序关系不变，故被支配/字典序
+    # 更大的点不可能再反超为最优。
+    dp: list[list[tuple[int, int, tuple[int, ...]]]] = [[] for _ in range(n + 1)]
+    dp[0] = [(0, 0, ())]
+    for candidate_index, (item_gas, item_cost_wei) in enumerate(candidates):
+        for k in range(candidate_index, -1, -1):
+            for gas, cost, items in dp[k]:
+                new_gas = gas + item_gas
+                new_cost = cost + item_cost_wei
+                if new_gas > max_total_gas or new_cost > max_cost_wei:
+                    continue
+                new_items = items + (candidate_index,)
+                points = dp[k + 1]
+                surviving: list[tuple[int, int, tuple[int, ...]]] = []
+                dominated = False
+                for old_gas, old_cost, old_items in points:
+                    if new_gas < old_gas and new_cost <= old_cost:
+                        continue  # 新点严格支配旧点（gas 维）
+                    if new_gas <= old_gas and new_cost < old_cost:
+                        continue  # 新点严格支配旧点（cost 维）
+                    if new_gas == old_gas and new_cost == old_cost:
+                        if new_items < old_items:
+                            continue  # 同限额下序号字典序更小，替换旧点
+                        dominated = True
+                        surviving.append((old_gas, old_cost, old_items))
+                        continue
+                    if old_gas <= new_gas and old_cost <= new_cost:
+                        dominated = True  # 旧点不劣于新点
+                    surviving.append((old_gas, old_cost, old_items))
+                if not dominated:
+                    surviving.append((new_gas, new_cost, new_items))
+                dp[k + 1] = surviving
+
+    # 从最大 k 向下取第一个有可行方案的；同 k 取 (gas, cost) 字典序最小者。
+    for k in range(n, -1, -1):
+        if dp[k]:
+            gas, cost, chosen = min(dp[k], key=lambda point: (point[0], point[1]))
+            return chosen, gas, cost
+    return (), 0, 0
+
+
+def plan_bundle_max_count(document: Any) -> dict[str, Any]:
+    """以入选数量最大化为目标的批量打包规划。
+
+    文档结构、校验次序、错误码与结果结构与 ``plan_bundle`` 相同；区别在于
+    approved 请求在 ``maxTotalGas`` 与 ``maxCostWei`` 两条限额下全局择优：先
+    最大化入选数量，数量并列时依次取总 ``totalGas`` 较小、总
+    ``estimatedCostWei`` 较小、下标序列字典序较小的唯一方案。只返回字典，不
+    抛业务异常。
+    """
+    prepared = _prepare(document)
+    if isinstance(prepared, dict):
+        return prepared
+    requests, sponsorship_policy, max_total_gas, max_cost_wei = prepared
+
+    decisions = _evaluate_all(requests, sponsorship_policy)
+
+    skipped: list[dict[str, Any]] = []
+    # profiles 按原下标递增压入，平行的 indices 记录原下标；候选序号（enumerate
+    # 顺序）与原下标顺序同构，故候选序号元组的字典序即 selected 下标序列字典序。
+    profiles: list[tuple[int, int]] = []
+    indices: list[int] = []
+    for index, decision in enumerate(decisions):
+        if not decision["approved"]:
+            skipped.append({"index": index, "reason": decision["reason"]})
+        else:
+            profiles.append(
+                (
+                    int(decision["totalGas"]),
+                    int(decision["estimatedCostWei"]),
+                )
+            )
+            indices.append(index)
+
+    chosen, chosen_gas, _ = _choose_max_count(
+        profiles, max_total_gas, max_cost_wei
+    )
+
+    chosen_set = set(chosen)
+    selected = [indices[item] for item in chosen]
+    for item, (item_gas, _) in enumerate(profiles):
+        if item in chosen_set:
+            continue
+        if chosen_gas + item_gas > max_total_gas:
+            skipped.append({"index": indices[item], "reason": REASON_BUNDLE_GAS})
+        else:
+            # chosen 已达最大可行数量，该项并入不可能两条限额都不超。
+            skipped.append({"index": indices[item], "reason": REASON_BUNDLE_BUDGET})
 
     return _plan_result(selected, skipped, decisions)
