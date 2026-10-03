@@ -8,7 +8,7 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 
 ## 状态
 
-已实现 ERC-4337 v0.7 UserOperation 静态校验，并在此基线上提供 Gas 代付决策。不验签、不模拟链上执行、不访问外部系统、不落盘。
+已实现 ERC-4337 v0.7 UserOperation 静态校验，并在此基线上提供 Gas 代付决策与批量打包规划。不验签、不模拟链上执行、不访问外部系统、不落盘。
 
 ## 用法
 
@@ -17,9 +17,11 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 ```python
 from paymaster.validation import validate
 from paymaster.sponsorship import evaluate_sponsorship
+from paymaster.packing import plan_bundle
 
 result = validate(request)  # request 为已解析的 JSON 值，只返回字典，不抛业务异常
 decision = evaluate_sponsorship(request, policy)  # 先走 validate，再评估代付
+plan = plan_bundle(document)  # 逐项评估代付，再按 bundlePolicy 限额入选
 ```
 
 命令行（从标准输入读 JSON，只向标准输出写一个 JSON 文档；结果 `ok` 为 true 退出 0，否则退出 1）：
@@ -27,6 +29,7 @@ decision = evaluate_sponsorship(request, policy)  # 先走 validate，再评估�
 ```sh
 python -m paymaster.validate < request.json
 python -m paymaster.sponsor < sponsorship.json  # {"request": ..., "policy": ...}
+python -m paymaster.pack < bundle.json  # {"requests": [...], "sponsorshipPolicy": ..., "bundlePolicy": ...}
 ```
 
 ### 请求格式
@@ -63,6 +66,19 @@ python -m paymaster.sponsor < sponsorship.json  # {"request": ..., "policy": ...
 
 - 结构失败：`{"ok": false, "error": {"code", "path", "message"}}`。
 - 其他结果：`{"ok": true, "decision": {"approved", "reason", "totalGas", "estimatedCostWei"}}`，`totalGas` 与 `estimatedCostWei` 为十进制字符串。
+
+### 批量打包
+
+`plan_bundle(document)` 的 `document` 恰好含 `requests`、`sponsorshipPolicy`、`bundlePolicy` 三个键。`requests` 为上述请求的数组；`sponsorshipPolicy` 规则同单笔代付策略；`bundlePolicy` 恰好含 `maxTotalGas` 与 `maxCostWei`，均为规范 quantity 且大于 0。
+
+校验次序：根类型、未知键、缺键、requests（逐项）、策略（`sponsorshipPolicy` 先于 `bundlePolicy`；策略内部为根类型、缺键、未知键、字段值）。请求错误沿用 `validate` 的 code 与 message，path 前加 `/requests/<下标>`；策略错误码同单笔（`E_POLICY_*`），path 指向 `/sponsorshipPolicy` 或 `/bundlePolicy` 下的字段。
+
+校验通过后按 requests 顺序逐项决定：单笔 `approved` 为 false 的请求进入 `skipped` 并沿用其 reason；approved 项在累计 `totalGas` 与 `estimatedCostWei` 分别不超过 `bundlePolicy.maxTotalGas` 与 `bundlePolicy.maxCostWei` 时入选，否则进入 `skipped`——gas 先查，超限记 `E_BUNDLE_GAS`；成本后查，超限记 `E_BUNDLE_BUDGET`。空选择也是成功结果。
+
+结果格式：
+
+- 结构失败：`{"ok": false, "error": {"code", "path", "message"}}`。
+- 其他结果：`{"ok": true, "plan": {"selected", "skipped", "operationCount", "totalGas", "estimatedCostWei"}}`，`selected` 为下标数组，`skipped` 元素含 `index` 与 `reason`，`operationCount`、`totalGas`、`estimatedCostWei` 为十进制字符串。
 
 ## 测试
 

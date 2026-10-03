@@ -5,11 +5,13 @@
 - `paymaster.validation.validate(request)` 静态校验 ERC-4337 v0.7
   UserOperation 请求。
 - `paymaster.sponsorship.evaluate_sponsorship(request, policy)` 在校验通过的
-  请求上做 Gas 代付决策。后续在此基线上增加打包。
+  请求上做 Gas 代付决策。
+- `paymaster.packing.plan_bundle(document)` 在代付决策基线上做批量打包规划。
 """
 
+from paymaster.packing import plan_bundle
 from paymaster.sponsorship import evaluate_sponsorship
 from paymaster.validation import validate
 
-__all__ = ["validate", "evaluate_sponsorship"]
+__all__ = ["validate", "evaluate_sponsorship", "plan_bundle"]
 __version__ = "0.1.0"
