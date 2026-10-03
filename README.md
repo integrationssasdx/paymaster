@@ -17,11 +17,12 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 ```python
 from paymaster.validation import validate
 from paymaster.sponsorship import evaluate_sponsorship
-from paymaster.packing import plan_bundle
+from paymaster.packing import plan_bundle, plan_bundle_max_count
 
 result = validate(request)  # request 为已解析的 JSON 值，只返回字典，不抛业务异常
 decision = evaluate_sponsorship(request, policy)  # 先走 validate，再评估代付
 plan = plan_bundle(document)  # 逐项评估代付，再按 bundlePolicy 限额入选
+plan = plan_bundle_max_count(document)  # 以入选数量最大化为目标精确选包
 ```
 
 命令行（从标准输入读 JSON，只向标准输出写一个 JSON 文档；结果 `ok` 为 true 退出 0，否则退出 1）：
@@ -30,6 +31,7 @@ plan = plan_bundle(document)  # 逐项评估代付，再按 bundlePolicy 限额�
 python -m paymaster.validate < request.json
 python -m paymaster.sponsor < sponsorship.json  # {"request": ..., "policy": ...}
 python -m paymaster.pack < bundle.json  # {"requests": [...], "sponsorshipPolicy": ..., "bundlePolicy": ...}
+python -m paymaster.pack_max_count < bundle.json  # 同结构，以入选数量最大化为目标
 ```
 
 ### 请求格式
@@ -74,6 +76,10 @@ python -m paymaster.pack < bundle.json  # {"requests": [...], "sponsorshipPolicy
 校验次序：根类型、未知键、缺键、requests（逐项）、策略（`sponsorshipPolicy` 先于 `bundlePolicy`；策略内部为根类型、缺键、未知键、字段值）。请求错误沿用 `validate` 的 code 与 message，path 前加 `/requests/<下标>`；策略错误码同单笔（`E_POLICY_*`），path 指向 `/sponsorshipPolicy` 或 `/bundlePolicy` 下的字段。
 
 校验通过后按 requests 顺序逐项决定：单笔 `approved` 为 false 的请求进入 `skipped` 并沿用其 reason；approved 项在累计 `totalGas` 与 `estimatedCostWei` 分别不超过 `bundlePolicy.maxTotalGas` 与 `bundlePolicy.maxCostWei` 时入选，否则进入 `skipped`——gas 先查，超限记 `E_BUNDLE_GAS`；成本后查，超限记 `E_BUNDLE_BUDGET`。空选择也是成功结果。
+
+`plan_bundle_cost_first(document)` 与 CLI `python -m paymaster.pack_cost_first` 使用相同文档与结果结构，但 approved 项按 `estimatedCostWei` 升序、`totalGas` 升序、原下标升序排列后逐项贪心入选，被拒项不阻断后续较小请求。
+
+`plan_bundle_max_count(document)` 与 CLI `python -m paymaster.pack_max_count` 同样沿用上述文档结构、逐项校验、代付策略与检查顺序，但选择以入选数量最大化为目标：从全部 approved 请求中精确求同时满足 `maxTotalGas` 与 `maxCostWei` 的入选数最多子集。数量并列时依次取总 `totalGas` 较小、总 `estimatedCostWei` 较小、`selected` 下标序列字典序较小的唯一方案。最终方案确定后，未入选的 approved 请求加入该组先超 gas 记 `E_BUNDLE_GAS`，否则（必超成本）记 `E_BUNDLE_BUDGET`。`selected` 为升序下标数组，`skipped` 按 `index` 排序；`requests` 为空或最终无入选仍是成功结果。
 
 结果格式：
 
