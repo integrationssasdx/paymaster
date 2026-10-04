@@ -63,6 +63,18 @@ approved 项不再按顺序贪心，而是在 ``maxTotalGas`` 与 ``maxCostWei``
 ``E_NONCE_CONFLICT``；否则单独并入后先超 gas 记 ``E_BUNDLE_GAS``，不先超
 gas 但超成本记 ``E_BUNDLE_BUDGET``。
 
+``plan_bundle_nonce_chain`` 的文档结构、校验次序、错误码与结果结构同样沿用
+``plan_bundle``。approved 项按规范 sender 与 nonce 链分组：nonce 整数值除以
+2 的 64 次方，商为 key、余数为 sequence；同一 (sender, key) 组的入选项按
+requests 下标递增检查时，sequence 必须严格递增且相邻恰好相差 1（同一
+sequence 至多一项，且下标顺序与 sequence 顺序一致）。在该链约束与
+``maxTotalGas``、``maxCostWei`` 两条限额下求最优子集：先最大化入选数量，之
+后依次取总 ``totalGas`` 较小、总 ``estimatedCostWei`` 较小、``selected``
+下标序列字典序较小的唯一方案。未入选的 approved 请求只记一个原因：最终组已
+有同 sender、key、sequence 记 ``E_NONCE_CONFLICT``；并入后破坏连续链（下标
+递增时 sequence 不再严格递增且相邻相差 1）记 ``E_NONCE_GAP``；否则单独并入
+后先超 gas 记 ``E_BUNDLE_GAS``，不先超 gas 但超成本记 ``E_BUNDLE_BUDGET``。
+
 本模块不验签、不模拟执行、不访问节点、数据库或文件。
 """
 
@@ -92,6 +104,10 @@ REASON_BUNDLE_GAS = "E_BUNDLE_GAS"
 REASON_BUNDLE_BUDGET = "E_BUNDLE_BUDGET"
 REASON_SENDER_QUOTA = "E_SENDER_QUOTA"
 REASON_NONCE_CONFLICT = "E_NONCE_CONFLICT"
+REASON_NONCE_GAP = "E_NONCE_GAP"
+
+# nonce 链分组：nonce 整数值除以 2 的 64 次方，商为 key、余数为 sequence。
+_NONCE_SEQUENCE_MOD = 1 << 64
 
 # 根对象的必需键，顺序即缺键检查顺序。
 _ROOT_FIELDS = ("requests", "sponsorshipPolicy", "bundlePolicy")
@@ -835,6 +851,210 @@ def plan_bundle_nonce_unique(document: Any) -> dict[str, Any]:
         else:
             # chosen 已达约束下的最大可行数量：该项不冲突且 gas 不超，并入必
             # 然使总成本超限。
+            skipped.append({"index": index, "reason": REASON_BUNDLE_BUDGET})
+
+    return _plan_result(selected, skipped, decisions)
+
+
+def _chain_group_frontiers(
+    items: list[tuple[int, int, int, int]],
+    max_total_gas: int,
+    max_cost_wei: int,
+) -> list[list[tuple[int, int, tuple[int, ...]]]]:
+    """单个 (sender, key) 组的子集前沿：``dp[k]`` 为恰好选 k 项时的前沿。
+
+    ``items`` 为按候选序号递增的 ``(候选序号, sequence, gas, cost)`` 列表。
+    可行子集为一条链：按候选序号递增取出时 sequence 严格递增且相邻恰好相差
+    1。``ending[j][k]`` 保存以 ``items[j]`` 结尾、长度为 k 的链的 Pareto 前
+    沿；链只能从 sequence 恰好小 1 且候选序号更小的项延伸。已超两条限额的中
+    间点不可能进入可行方案，直接丢弃。同一 (结尾, 长度) 内被支配的点不可能
+    反超：后续可延伸的项对两点相同，gas 与 cost 都不更差者恒不更差；同
+    (gas, cost) 时序号元组字典序较小者胜（后续并入的序号都更大，字典序关系
+    不变）。
+    """
+    size = len(items)
+    ending: list[list[list[tuple[int, int, tuple[int, ...]]]]] = [
+        [[] for _ in range(size + 1)] for _ in range(size)
+    ]
+    dp: list[list[tuple[int, int, tuple[int, ...]]]] = [
+        [] for _ in range(size + 1)
+    ]
+    dp[0] = [(0, 0, ())]
+    for j, (position, sequence, item_gas, item_cost) in enumerate(items):
+        if item_gas > max_total_gas or item_cost > max_cost_wei:
+            continue  # 单项已超限额，任何可行方案都不会含它
+        additions: list[list[tuple[int, int, tuple[int, ...]]]] = [
+            [] for _ in range(size + 1)
+        ]
+        additions[1].append((item_gas, item_cost, (position,)))
+        # 候选序号递增遍历，i < j 即候选序号更小；只接 sequence 恰好小 1 的链。
+        for i in range(j):
+            if items[i][1] != sequence - 1:
+                continue
+            for k in range(1, size):
+                for gas, cost, chosen in ending[i][k]:
+                    new_gas = gas + item_gas
+                    new_cost = cost + item_cost
+                    if new_gas > max_total_gas or new_cost > max_cost_wei:
+                        continue
+                    additions[k + 1].append(
+                        (new_gas, new_cost, chosen + (position,))
+                    )
+        for k in range(1, size + 1):
+            if not additions[k]:
+                continue
+            ending[j][k] = _prune_frontier(additions[k])
+            dp[k] = _prune_frontier(dp[k] + ending[j][k])
+    return dp
+
+
+def _choose_nonce_chain(
+    candidates: list[tuple[Any, int, int, int, int]],
+    max_total_gas: int,
+    max_cost_wei: int,
+) -> tuple[tuple[int, ...], int, int]:
+    """在 nonce 链约束与两条限额下求最优入选子集。
+
+    ``candidates`` 为按原下标递增的 ``(sender, key, sequence, gas, cost)``
+    列表。目标依次：入选数量最大、总 gas 较小、总 cost 较小、候选序号序列字
+    典序较小。返回 ``(入选候选序号元组, 总gas, 总成本)``。
+    """
+    # 按 (sender, key) 分组，组内保持候选序号递增；组顺序按首次出现。
+    groups: dict[tuple[Any, int], list[tuple[int, int, int, int]]] = {}
+    for position, (sender, key, sequence, item_gas, item_cost) in enumerate(
+        candidates
+    ):
+        groups.setdefault((sender, key), []).append(
+            (position, sequence, item_gas, item_cost)
+        )
+
+    # 状态 入选数 -> (gas, cost, 候选序号元组) 的 Pareto 前沿，与
+    # _choose_nonce_unique 的跨组归并同构：被支配点不可能反超，同 (gas, cost)
+    # 时序号元组字典序在有序归并下保持。
+    states: dict[int, list[tuple[int, int, tuple[int, ...]]]] = {0: [(0, 0, ())]}
+    for items in groups.values():
+        frontiers = _chain_group_frontiers(items, max_total_gas, max_cost_wei)
+        merged_states: dict[int, list[tuple[int, int, tuple[int, ...]]]] = {}
+        for count, points in states.items():
+            for taken, frontier in enumerate(frontiers):
+                if not frontier:
+                    continue
+                additions = merged_states.setdefault(count + taken, [])
+                for gas, cost, chosen in points:
+                    for add_gas, add_cost, add_chosen in frontier:
+                        new_gas = gas + add_gas
+                        new_cost = cost + add_cost
+                        if new_gas > max_total_gas or new_cost > max_cost_wei:
+                            continue
+                        additions.append(
+                            (new_gas, new_cost, tuple(sorted(chosen + add_chosen)))
+                        )
+        states = {
+            count: _prune_frontier(points)
+            for count, points in merged_states.items()
+        }
+
+    # 前沿按 (gas, cost, 序号元组) 升序，首元素即该入选数的最优方案。
+    best: tuple[tuple[int, ...], int, int] = ((), 0, 0)
+    best_key: tuple[Any, ...] | None = None
+    for count, frontier in states.items():
+        if not frontier:
+            continue
+        gas, cost, chosen = frontier[0]
+        key = (-count, gas, cost, chosen)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = (chosen, gas, cost)
+    return best
+
+
+def plan_bundle_nonce_chain(document: Any) -> dict[str, Any]:
+    """按账户 nonce 链约束的批量打包规划。
+
+    文档结构、校验次序、错误码与结果结构与 ``plan_bundle`` 相同；区别在于
+    approved 请求按规范化的 sender（小写地址）与 nonce 分组：nonce 整数值除
+    以 2 的 64 次方，商为 key、余数为 sequence。同一 (sender, key) 组的入选
+    项按 requests 下标递增检查时，sequence 必须严格递增且相邻恰好相差 1。在
+    该链约束与两条 bundle 限额下全局择优：先最大化入选数量，数量并列时依次
+    取总 ``totalGas`` 较小、总 ``estimatedCostWei`` 较小、``selected`` 下标
+    序列字典序较小的唯一方案。未入选的 approved 请求只记一个原因：最终组已
+    有同 sender、key、sequence 记 ``E_NONCE_CONFLICT``；并入后破坏连续链记
+    ``E_NONCE_GAP``；否则单独并入后先超 gas 记 ``E_BUNDLE_GAS``，不先超 gas
+    但超成本记 ``E_BUNDLE_BUDGET``。只返回字典，不抛业务异常。
+    """
+    prepared = _prepare(document)
+    if isinstance(prepared, dict):
+        return prepared
+    requests, sponsorship_policy, max_total_gas, max_cost_wei = prepared
+
+    decisions = _evaluate_all(requests, sponsorship_policy)
+
+    skipped: list[dict[str, Any]] = []
+    # candidates 按原下标递增压入，平行的 indices 记录原下标；sender 取校验后
+    # 的规范地址（小写），nonce 取规范 quantity 的整数值再拆分 key/sequence，
+    # 故大小写或前导零差异不产生新键。
+    candidates: list[tuple[Any, int, int, int, int]] = []
+    indices: list[int] = []
+    for index, (request, decision) in enumerate(zip(requests, decisions)):
+        if not decision["approved"]:
+            skipped.append({"index": index, "reason": decision["reason"]})
+            continue
+        # 请求已通过校验，此处取规范 sender/nonce 必然成功。
+        user_op = validate(request)["normalized"]["userOperation"]
+        nonce = int(user_op["nonce"], 16)
+        candidates.append(
+            (
+                user_op["sender"],
+                nonce // _NONCE_SEQUENCE_MOD,
+                nonce % _NONCE_SEQUENCE_MOD,
+                int(decision["totalGas"]),
+                int(decision["estimatedCostWei"]),
+            )
+        )
+        indices.append(index)
+
+    chosen, chosen_gas, _ = _choose_nonce_chain(
+        candidates, max_total_gas, max_cost_wei
+    )
+
+    chosen_set = set(chosen)
+    selected = [indices[item] for item in chosen]
+    # 每个 (sender, key) 组最终入选的 sequence -> 候选序号，用于判断落选项
+    # 是重复 sequence 还是破坏连续链。
+    chosen_sequences: dict[tuple[Any, int], dict[int, int]] = {}
+    for item in chosen:
+        sender, key, sequence = candidates[item][:3]
+        chosen_sequences.setdefault((sender, key), {})[sequence] = item
+
+    for item, (sender, key, sequence, item_gas, _) in enumerate(candidates):
+        if item in chosen_set:
+            continue
+        index = indices[item]
+        sequences = chosen_sequences.get((sender, key))
+        if sequences is None:
+            # 组内无入选项：单独成链必然合法，只可能受两条限额阻挡。
+            extends = True
+        elif sequence in sequences:
+            extends = False
+            skipped.append({"index": index, "reason": REASON_NONCE_CONFLICT})
+            continue
+        else:
+            lowest = min(sequences)
+            highest = max(sequences)
+            # 入选链的 sequence 连续，并入后仍为连续链当且仅当该项接在链的
+            # 某一端，且候选序号（与原下标同序）落在对应端点之外。
+            extends = (
+                sequence == lowest - 1 and item < sequences[lowest]
+            ) or (
+                sequence == highest + 1 and item > sequences[highest]
+            )
+        if not extends:
+            skipped.append({"index": index, "reason": REASON_NONCE_GAP})
+        elif chosen_gas + item_gas > max_total_gas:
+            skipped.append({"index": index, "reason": REASON_BUNDLE_GAS})
+        else:
+            # chosen 已达约束下的最大可行数量：该项并入不破坏链且 gas 不超，
+            # 并入必然使总成本超限。
             skipped.append({"index": index, "reason": REASON_BUNDLE_BUDGET})
 
     return _plan_result(selected, skipped, decisions)
