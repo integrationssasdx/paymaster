@@ -52,6 +52,16 @@ approved 项不再按顺序贪心，而是在 ``maxTotalGas`` 与 ``maxCostWei``
 并入后先超 gas 记 ``E_BUNDLE_GAS``，不先超 gas 但超成本记
 ``E_BUNDLE_BUDGET``。
 
+``plan_bundle_nonce_unique`` 的文档与 ``plan_bundle`` 相同（恰好含
+``requests``、``sponsorshipPolicy``、``bundlePolicy``），校验次序、错误码与
+结果结构沿用上述约定。approved 请求按规范化结果判冲突：sender 取规范小写地
+址，nonce 取规范 quantity；同 sender 同 nonce 的请求不同时入选，其他组合不
+受限制。在 ``maxTotalGas`` 与 ``maxCostWei`` 两条限额与冲突约束下求最优子
+集：先最大化入选数量，再依次取总 ``totalGas`` 较小、总 ``estimatedCostWei``
+较小、``selected`` 下标序列字典序较小的唯一方案。未入选的 approved 请求只
+记一个原因：最终组已有同 sender 同 nonce 记 ``E_NONCE_CONFLICT``；否则并入
+后先超 gas 记 ``E_BUNDLE_GAS``，不先超 gas 但超成本记 ``E_BUNDLE_BUDGET``。
+
 本模块不验签、不模拟执行、不访问节点、数据库或文件。
 """
 
@@ -80,6 +90,7 @@ from paymaster.validation import (
 REASON_BUNDLE_GAS = "E_BUNDLE_GAS"
 REASON_BUNDLE_BUDGET = "E_BUNDLE_BUDGET"
 REASON_SENDER_QUOTA = "E_SENDER_QUOTA"
+REASON_NONCE_CONFLICT = "E_NONCE_CONFLICT"
 
 # 根对象的必需键，顺序即缺键检查顺序。
 _ROOT_FIELDS = ("requests", "sponsorshipPolicy", "bundlePolicy")
@@ -677,6 +688,121 @@ def plan_bundle_sender_fair(document: Any) -> dict[str, Any]:
         else:
             # chosen 已达最大可行数量，该项 sender 未满且 gas 不超，并入必然
             # 使总成本超限。
+            skipped.append({"index": index, "reason": REASON_BUNDLE_BUDGET})
+
+    return _plan_result(selected, skipped, decisions)
+
+
+def _choose_nonce_unique(
+    candidates: list[tuple[Any, int, int]],
+    max_total_gas: int,
+    max_cost_wei: int,
+) -> tuple[tuple[int, ...], int, int]:
+    """在两条限额与同 (sender, nonce) 至多一项的约束下求最优入选子集。
+
+    ``candidates`` 为按原下标递增的 ``((sender, nonce), gas, cost)`` 列表。
+    目标依次：入选数量最大、总 gas 较小、总 cost 较小、候选序号序列字典序
+    较小。返回 ``(入选候选序号元组, 总gas, 总成本)``。
+    """
+    # 按 (sender, nonce) 分组，组内保持候选序号递增；每组至多取一项（多选
+    # 一背包）。组顺序按首次出现。
+    groups: dict[Any, list[tuple[int, int, int]]] = {}
+    for position, (key, item_gas, item_cost) in enumerate(candidates):
+        groups.setdefault(key, []).append((position, item_gas, item_cost))
+
+    # dp[k] 为恰好选 k 项时的 (gas, cost, 候选序号元组) Pareto 前沿。同
+    # (gas, cost) 只保留序号元组字典序最小者：后续并入的组选项对两点相同，
+    # 等长有序元组并上同一不相交集合后字典序关系不变，故被支配/字典序更大
+    # 的点不可能再反超为最优。
+    n = len(candidates)
+    dp: list[list[tuple[int, int, tuple[int, ...]]]] = [[] for _ in range(n + 1)]
+    dp[0] = [(0, 0, ())]
+    for group in groups.values():
+        next_dp = [list(points) for points in dp]  # 本组一项都不取
+        for k in range(n - 1, -1, -1):
+            for gas, cost, chosen in dp[k]:
+                for position, item_gas, item_cost in group:
+                    new_gas = gas + item_gas
+                    new_cost = cost + item_cost
+                    if new_gas > max_total_gas or new_cost > max_cost_wei:
+                        continue
+                    next_dp[k + 1].append(
+                        (
+                            new_gas,
+                            new_cost,
+                            tuple(sorted(chosen + (position,))),
+                        )
+                    )
+        dp = [_prune_frontier(points) for points in next_dp]
+
+    # 从最大 k 向下取第一个有可行方案的；前沿按 (gas, cost, 序号元组) 升序，
+    # 首元素即该 k 的最优点。
+    for k in range(n, -1, -1):
+        if dp[k]:
+            gas, cost, chosen = dp[k][0]
+            return chosen, gas, cost
+    return (), 0, 0
+
+
+def plan_bundle_nonce_unique(document: Any) -> dict[str, Any]:
+    """同账户 nonce 不冲突的批量打包规划。
+
+    文档结构、校验次序、错误码与结果结构与 ``plan_bundle`` 相同；区别在于
+    approved 请求按规范化 ``sender``（小写地址）与 ``nonce``（规范
+    quantity）判冲突，同 sender 同 nonce 不同时入选。在冲突约束与
+    ``maxTotalGas``、``maxCostWei`` 两条限额下全局择优：先最大化入选数
+    量，数量并列时依次取总 ``totalGas`` 较小、总 ``estimatedCostWei`` 较
+    小、下标序列字典序较小的唯一方案。未入选的 approved 请求只记一个原
+    因：最终组已有同 sender 同 nonce 记 ``E_NONCE_CONFLICT``；否则并入后
+    先超 gas 记 ``E_BUNDLE_GAS``，不先超 gas 但超成本记
+    ``E_BUNDLE_BUDGET``。只返回字典，不抛业务异常。
+    """
+    prepared = _prepare(document)
+    if isinstance(prepared, dict):
+        return prepared
+    requests, sponsorship_policy, max_total_gas, max_cost_wei = prepared
+
+    decisions = _evaluate_all(requests, sponsorship_policy)
+
+    skipped: list[dict[str, Any]] = []
+    # candidates 按原下标递增压入，平行的 indices 记录原下标；sender 与
+    # nonce 取校验后的规范值，大小写/前导零差异不影响冲突判定。
+    candidates: list[tuple[Any, int, int]] = []
+    indices: list[int] = []
+    for index, (request, decision) in enumerate(zip(requests, decisions)):
+        if not decision["approved"]:
+            skipped.append({"index": index, "reason": decision["reason"]})
+            continue
+        # 请求已通过校验，此处取规范 sender 与 nonce 必然成功。
+        user_op = validate(request)["normalized"]["userOperation"]
+        candidates.append(
+            (
+                (user_op["sender"], user_op["nonce"]),
+                int(decision["totalGas"]),
+                int(decision["estimatedCostWei"]),
+            )
+        )
+        indices.append(index)
+
+    chosen, chosen_gas, _ = _choose_nonce_unique(
+        candidates, max_total_gas, max_cost_wei
+    )
+
+    chosen_set = set(chosen)
+    selected = [indices[item] for item in chosen]
+    chosen_keys = {candidates[item][0] for item in chosen}
+
+    for item, (key, item_gas, _) in enumerate(candidates):
+        if item in chosen_set:
+            continue
+        index = indices[item]
+        if key in chosen_keys:
+            skipped.append({"index": index, "reason": REASON_NONCE_CONFLICT})
+        elif chosen_gas + item_gas > max_total_gas:
+            skipped.append({"index": index, "reason": REASON_BUNDLE_GAS})
+        else:
+            # chosen 已达最大可行数量，该项无冲突且 gas 不超，并入必然使总
+            # 成本超限。
             skipped.append({"index": index, "reason": REASON_BUNDLE_BUDGET})
 
     return _plan_result(selected, skipped, decisions)

@@ -12,12 +12,15 @@
   批量打包规划。
 - `paymaster.packing.plan_bundle_sender_fair(document)` 按 sender 公平约束的
   批量打包规划。
+- `paymaster.packing.plan_bundle_nonce_unique(document)` 同账户 nonce 不冲突
+  的批量打包规划。
 """
 
 from paymaster.packing import (
     plan_bundle,
     plan_bundle_cost_first,
     plan_bundle_max_count,
+    plan_bundle_nonce_unique,
     plan_bundle_sender_fair,
 )
 from paymaster.sponsorship import evaluate_sponsorship
@@ -29,6 +32,7 @@ __all__ = [
     "plan_bundle",
     "plan_bundle_cost_first",
     "plan_bundle_max_count",
+    "plan_bundle_nonce_unique",
     "plan_bundle_sender_fair",
 ]
 __version__ = "0.1.0"
