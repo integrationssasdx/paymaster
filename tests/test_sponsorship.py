@@ -64,12 +64,65 @@ def decision_of(result: dict) -> dict:
 class TestDecision(unittest.TestCase):
     def test_approved_ok(self):
         # totalGas = 0x10000 + 0x20000 + 0x30000 = 0x60000 = 393216
-        # cost = 393216 * 0x10 = 6291456
+        # effectiveGasPriceWei = min(0x10, 0x7 + 0x10) = 0x10
+        # cost = 393216 * 16 = 6291456
         decision = decision_of(evaluate_sponsorship(valid_request(), valid_policy()))
         self.assertEqual(decision["approved"], True)
         self.assertEqual(decision["reason"], "OK")
         self.assertEqual(decision["totalGas"], "393216")
+        self.assertEqual(decision["effectiveGasPriceWei"], "16")
         self.assertEqual(decision["estimatedCostWei"], "6291456")
+
+    def test_effective_gas_price_uses_base_fee_plus_tip_when_below_cap(self):
+        req = valid_request()
+        req["userOperation"]["maxFeePerGas"] = "0x100"
+        req["userOperation"]["maxPriorityFeePerGas"] = "0x0"
+        # min(0x100, 0x7 + 0x0) = 0x7
+        decision = decision_of(evaluate_sponsorship(req, valid_policy()))
+        self.assertEqual(decision["effectiveGasPriceWei"], "7")
+        self.assertEqual(decision["estimatedCostWei"], str(393216 * 7))
+
+    def test_effective_gas_price_when_base_plus_tip_equals_cap(self):
+        req = valid_request()
+        req["userOperation"]["maxFeePerGas"] = "0xa"
+        req["userOperation"]["maxPriorityFeePerGas"] = "0x5"
+        req["context"]["baseFeePerGas"] = "0x5"
+        # min(0xa, 0x5 + 0x5) = 0xa
+        decision = decision_of(evaluate_sponsorship(req, valid_policy()))
+        self.assertEqual(decision["effectiveGasPriceWei"], "10")
+        self.assertEqual(decision["estimatedCostWei"], str(393216 * 10))
+
+    def test_cost_based_on_effective_price_not_max_fee(self):
+        # cap 很大但 tip 为 0：旧公式按 cap 计必超预算，新公式按 baseFee 计通过。
+        req = valid_request()
+        req["userOperation"]["maxFeePerGas"] = "0x100"
+        req["userOperation"]["maxPriorityFeePerGas"] = "0x0"
+        policy = valid_policy()
+        policy["budgetWei"] = hex(393216 * 8)  # 在 393216*7 与 393216*256 之间
+        decision = decision_of(evaluate_sponsorship(req, policy))
+        self.assertEqual(decision["approved"], True)
+        self.assertEqual(decision["reason"], "OK")
+        self.assertEqual(decision["estimatedCostWei"], str(393216 * 7))
+
+    def test_cost_above_budget_uses_effective_price(self):
+        req = valid_request()
+        req["userOperation"]["maxFeePerGas"] = "0x100"
+        req["userOperation"]["maxPriorityFeePerGas"] = "0x0"
+        policy = valid_policy()
+        policy["budgetWei"] = hex(393216 * 7 - 1)
+        decision = decision_of(evaluate_sponsorship(req, policy))
+        self.assertEqual(decision["approved"], False)
+        self.assertEqual(decision["reason"], "E_BUDGET")
+
+    def test_cost_equal_budget_uses_effective_price(self):
+        req = valid_request()
+        req["userOperation"]["maxFeePerGas"] = "0x100"
+        req["userOperation"]["maxPriorityFeePerGas"] = "0x0"
+        policy = valid_policy()
+        policy["budgetWei"] = hex(393216 * 7)
+        decision = decision_of(evaluate_sponsorship(req, policy))
+        self.assertEqual(decision["approved"], True)
+        self.assertEqual(decision["reason"], "OK")
 
     def test_paymaster_gas_fields_included_in_total(self):
         req = valid_request()
@@ -82,6 +135,7 @@ class TestDecision(unittest.TestCase):
         # totalGas = 0x60000 + 0x40000 + 0x50000 = 0xf0000 = 983040
         decision = decision_of(evaluate_sponsorship(req, valid_policy()))
         self.assertEqual(decision["totalGas"], "983040")
+        self.assertEqual(decision["effectiveGasPriceWei"], "16")
         self.assertEqual(decision["estimatedCostWei"], str(983040 * 16))
 
     def test_total_gas_above_limit_rejected(self):
@@ -119,10 +173,19 @@ class TestDecision(unittest.TestCase):
 
     def test_numeric_results_are_decimal_strings(self):
         decision = decision_of(evaluate_sponsorship(valid_request(), valid_policy()))
-        self.assertIsInstance(decision["totalGas"], str)
-        self.assertIsInstance(decision["estimatedCostWei"], str)
-        self.assertRegex(decision["totalGas"], r"^[0-9]+$")
-        self.assertRegex(decision["estimatedCostWei"], r"^[0-9]+$")
+        self.assertEqual(
+            set(decision.keys()),
+            {
+                "approved",
+                "reason",
+                "totalGas",
+                "estimatedCostWei",
+                "effectiveGasPriceWei",
+            },
+        )
+        for key in ("totalGas", "estimatedCostWei", "effectiveGasPriceWei"):
+            self.assertIsInstance(decision[key], str)
+            self.assertRegex(decision[key], r"^[0-9]+$")
 
     def test_inputs_not_mutated(self):
         req = valid_request()

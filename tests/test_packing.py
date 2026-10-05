@@ -12,7 +12,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from paymaster.packing import plan_bundle  # noqa: E402
+from paymaster.packing import plan_bundle, plan_bundle_cost_first  # noqa: E402
 from paymaster.sponsorship import (  # noqa: E402
     E_POLICY_INVALID_FIELD,
     E_POLICY_MISSING_FIELD,
@@ -110,7 +110,7 @@ class TestPlan(unittest.TestCase):
     def test_unapproved_budget_reason_kept(self):
         doc = valid_document(1)
         doc["requests"][0]["userOperation"]["maxFeePerGas"] = "0xde0b6b3a7640000"
-        doc["requests"][0]["userOperation"]["maxPriorityFeePerGas"] = "0x10"
+        doc["requests"][0]["userOperation"]["maxPriorityFeePerGas"] = "0xde0b6b3a7640000"
         plan = plan_of(plan_bundle(doc))
         self.assertEqual(plan["skipped"], [{"index": 0, "reason": "E_BUDGET"}])
 
@@ -129,6 +129,59 @@ class TestPlan(unittest.TestCase):
         self.assertEqual(plan["selected"], [0])
         self.assertEqual(plan["skipped"], [{"index": 1, "reason": "E_BUNDLE_BUDGET"}])
         self.assertEqual(plan["estimatedCostWei"], str(ITEM_COST))
+
+    def test_bundle_budget_uses_effective_gas_price(self):
+        # cap 远高于 baseFee、tip 为 0 时，入选成本按 baseFee(0x7) 而非
+        # maxFee 估算：旧公式会超预算，新公式两笔均可入选。
+        doc = valid_document(2)
+        for request in doc["requests"]:
+            op = request["userOperation"]
+            op["maxFeePerGas"] = "0x100"
+            op["maxPriorityFeePerGas"] = "0x0"
+        doc["bundlePolicy"]["maxCostWei"] = hex(ITEM_GAS * 7 * 2)
+        plan = plan_of(plan_bundle(doc))
+        self.assertEqual(plan["selected"], [0, 1])
+        self.assertEqual(plan["estimatedCostWei"], str(ITEM_GAS * 7 * 2))
+
+    def test_bundle_budget_effective_price_boundary(self):
+        # 预算恰好等于两笔按基础费率估算的成本时全部入选（等于限额仍通过）。
+        doc = valid_document(1)
+        op = doc["requests"][0]["userOperation"]
+        op["maxFeePerGas"] = "0x100"
+        op["maxPriorityFeePerGas"] = "0x0"
+        doc["bundlePolicy"]["maxCostWei"] = hex(ITEM_GAS * 7)
+        plan = plan_of(plan_bundle(doc))
+        self.assertEqual(plan["selected"], [0])
+        self.assertEqual(plan["skipped"], [])
+
+    def test_cost_first_orders_by_effective_price_cost(self):
+        # 按 maxFee 排序会先取贵项 0；按基础费率估算时 0 号 tip=0（实际价格
+        # 仅 7），反而更便宜，应优先入选并占满预算。
+        cheap_effective = valid_request()
+        op0 = cheap_effective["userOperation"]
+        op0["maxFeePerGas"] = "0x100"
+        op0["maxPriorityFeePerGas"] = "0x0"  # effective = 7
+        pricey_effective = valid_request()
+        op1 = pricey_effective["userOperation"]
+        op1["maxFeePerGas"] = "0x10"
+        op1["maxPriorityFeePerGas"] = "0x10"  # effective = 16
+
+        doc = {
+            "requests": [cheap_effective, pricey_effective],
+            "sponsorshipPolicy": {
+                "budgetWei": "0xde0b6b3a7640000",
+                "maxTotalGas": "0x100000",
+            },
+            # 预算只够 0 号按基础费率估算的一笔。
+            "bundlePolicy": {
+                "maxTotalGas": hex(ITEM_GAS * 2),
+                "maxCostWei": hex(ITEM_GAS * 7),
+            },
+        }
+        plan = plan_of(plan_bundle_cost_first(doc))
+        self.assertEqual(plan["selected"], [0])
+        self.assertEqual(plan["skipped"], [{"index": 1, "reason": "E_BUNDLE_BUDGET"}])
+        self.assertEqual(plan["estimatedCostWei"], str(ITEM_GAS * 7))
 
     def test_bundle_gas_checked_before_budget(self):
         doc = valid_document(2)

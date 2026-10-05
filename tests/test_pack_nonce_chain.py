@@ -60,7 +60,9 @@ def make_request(
             "verificationGasLimit": "0x20000",
             "preVerificationGas": "0x30000",
             "maxFeePerGas": hex(max_fee),
-            "maxPriorityFeePerGas": "0x0",
+            # tip 与 cap 取相同值：baseFee(0x7) + tip >= maxFee，使
+            # effectiveGasPriceWei = min(maxFee, baseFee + tip) 恰为 maxFee。
+            "maxPriorityFeePerGas": hex(max_fee),
             "signature": "0x",
         },
         "context": {

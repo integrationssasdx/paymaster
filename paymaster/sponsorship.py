@@ -11,8 +11,8 @@
   - request 或 policy 结构性失败：``{"ok": False, "error": {"code", "path",
     "message"}}``；
   - 其他结果：``{"ok": True, "decision": {...}}``，``decision`` 含
-    ``approved``、``reason``、``totalGas``、``estimatedCostWei``，其中两个
-    数值为十进制字符串。
+    ``approved``、``reason``、``totalGas``、``estimatedCostWei`` 与
+    ``effectiveGasPriceWei``，其中三个数值为十进制字符串。
 
 policy 错误码：
 
@@ -112,6 +112,7 @@ def evaluate_sponsorship(request: Any, policy: Any) -> dict[str, Any]:
     assert policy_fields is not None
 
     user_op = result["normalized"]["userOperation"]
+    context = result["normalized"]["context"]
     total_gas = (
         int(user_op["callGasLimit"], 16)
         + int(user_op["verificationGasLimit"], 16)
@@ -119,7 +120,13 @@ def evaluate_sponsorship(request: Any, policy: Any) -> dict[str, Any]:
         + int(user_op.get("paymasterVerificationGasLimit", "0x0"), 16)
         + int(user_op.get("paymasterPostOpGasLimit", "0x0"), 16)
     )
-    estimated_cost_wei = total_gas * int(user_op["maxFeePerGas"], 16)
+    # 以基础费率估算：min(maxFeePerGas, baseFeePerGas + maxPriorityFeePerGas)。
+    effective_gas_price_wei = min(
+        int(user_op["maxFeePerGas"], 16),
+        int(context["baseFeePerGas"], 16)
+        + int(user_op["maxPriorityFeePerGas"], 16),
+    )
+    estimated_cost_wei = total_gas * effective_gas_price_wei
 
     if total_gas > int(policy_fields["maxTotalGas"], 16):
         approved, reason = False, REASON_GAS_LIMIT
@@ -135,5 +142,6 @@ def evaluate_sponsorship(request: Any, policy: Any) -> dict[str, Any]:
             "reason": reason,
             "totalGas": str(total_gas),
             "estimatedCostWei": str(estimated_cost_wei),
+            "effectiveGasPriceWei": str(effective_gas_price_wei),
         },
     }
