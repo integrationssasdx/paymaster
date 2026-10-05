@@ -73,12 +73,12 @@ python -m paymaster.pack_sender_budget < bundle.json  # 按 sender 聚合 Gas �
 - `policy` 恰好含 `budgetWei` 与 `maxTotalGas` 两个键，均为规范 quantity 且大于 0。检查顺序：根类型、必需键、未知键、字段值（`budgetWei` 先于 `maxTotalGas`；缺键先于未知键）。
 - policy 错误码：`E_POLICY_INVALID_FIELD`（根非对象或值非法）、`E_POLICY_MISSING_FIELD`（缺键）、`E_POLICY_UNKNOWN_FIELD`（未知键）。根 path 为空，字段 path 指向键。
 
-校验通过后：`totalGas` 为 `callGasLimit`、`verificationGasLimit`、`preVerificationGas` 与可选 `paymasterVerificationGasLimit`、`paymasterPostOpGasLimit` 的整数和；`estimatedCostWei` 为 `totalGas` 乘 `maxFeePerGas`。`totalGas` 大于 `maxTotalGas` 时 `approved` 为 false、`reason` 为 `E_GAS_LIMIT`；否则 `estimatedCostWei` 大于 `budgetWei` 时 `approved` 为 false、`reason` 为 `E_BUDGET`；其余 `approved` 为 true、`reason` 为 `OK`。
+校验通过后：`totalGas` 为 `callGasLimit`、`verificationGasLimit`、`preVerificationGas` 与可选 `paymasterVerificationGasLimit`、`paymasterPostOpGasLimit` 的整数和；`effectiveGasPriceWei` 为 `maxFeePerGas` 与 `context.baseFeePerGas + maxPriorityFeePerGas` 的较小者；`estimatedCostWei` 为 `totalGas` 乘 `effectiveGasPriceWei`。`totalGas` 大于 `maxTotalGas` 时 `approved` 为 false、`reason` 为 `E_GAS_LIMIT`；否则 `estimatedCostWei` 大于 `budgetWei` 时 `approved` 为 false、`reason` 为 `E_BUDGET`；其余 `approved` 为 true、`reason` 为 `OK`。
 
 结果格式：
 
 - 结构失败：`{"ok": false, "error": {"code", "path", "message"}}`。
-- 其他结果：`{"ok": true, "decision": {"approved", "reason", "totalGas", "estimatedCostWei"}}`，`totalGas` 与 `estimatedCostWei` 为十进制字符串。
+- 其他结果：`{"ok": true, "decision": {"approved", "reason", "totalGas", "estimatedCostWei", "effectiveGasPriceWei"}}`，`totalGas`、`estimatedCostWei` 与 `effectiveGasPriceWei` 为十进制字符串。
 
 ### 批量打包
 

@@ -47,7 +47,7 @@ def make_request(call_gas: int = 0x10000, max_fee: int = 0x10) -> dict:
             "verificationGasLimit": "0x20000",
             "preVerificationGas": "0x30000",
             "maxFeePerGas": hex(max_fee),
-            "maxPriorityFeePerGas": "0x0",
+            "maxPriorityFeePerGas": hex(max_fee),
             "signature": "0x",
         },
         "context": {

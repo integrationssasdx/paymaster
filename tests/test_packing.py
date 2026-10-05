@@ -109,8 +109,10 @@ class TestPlan(unittest.TestCase):
 
     def test_unapproved_budget_reason_kept(self):
         doc = valid_document(1)
+        # effectiveGasPriceWei = min(maxFeePerGas, baseFeePerGas + priority)，
+        # 两者同时抬高才能使估算成本超过预算。
         doc["requests"][0]["userOperation"]["maxFeePerGas"] = "0xde0b6b3a7640000"
-        doc["requests"][0]["userOperation"]["maxPriorityFeePerGas"] = "0x10"
+        doc["requests"][0]["userOperation"]["maxPriorityFeePerGas"] = "0xde0b6b3a7640000"
         plan = plan_of(plan_bundle(doc))
         self.assertEqual(plan["skipped"], [{"index": 0, "reason": "E_BUDGET"}])
 

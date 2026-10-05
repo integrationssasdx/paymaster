@@ -121,8 +121,37 @@ class TestDecision(unittest.TestCase):
         decision = decision_of(evaluate_sponsorship(valid_request(), valid_policy()))
         self.assertIsInstance(decision["totalGas"], str)
         self.assertIsInstance(decision["estimatedCostWei"], str)
+        self.assertIsInstance(decision["effectiveGasPriceWei"], str)
         self.assertRegex(decision["totalGas"], r"^[0-9]+$")
         self.assertRegex(decision["estimatedCostWei"], r"^[0-9]+$")
+        self.assertRegex(decision["effectiveGasPriceWei"], r"^[0-9]+$")
+
+    def test_effective_gas_price_capped_by_max_fee(self):
+        # baseFeePerGas + maxPriorityFeePerGas = 0x7 + 0x10 = 0x17 > maxFeePerGas，
+        # 生效价格取 maxFeePerGas = 0x10。
+        decision = decision_of(evaluate_sponsorship(valid_request(), valid_policy()))
+        self.assertEqual(decision["effectiveGasPriceWei"], "16")
+        self.assertEqual(decision["estimatedCostWei"], str(393216 * 16))
+
+    def test_effective_gas_price_capped_by_base_plus_priority(self):
+        # baseFeePerGas + maxPriorityFeePerGas = 0x7 + 0x1 = 0x8 < maxFeePerGas，
+        # 生效价格取 0x8。
+        req = valid_request()
+        req["userOperation"]["maxPriorityFeePerGas"] = "0x1"
+        decision = decision_of(evaluate_sponsorship(req, valid_policy()))
+        self.assertEqual(decision["effectiveGasPriceWei"], "8")
+        self.assertEqual(decision["estimatedCostWei"], str(393216 * 8))
+
+    def test_cost_estimate_uses_effective_gas_price(self):
+        # 预算低于按 maxFeePerGas 的旧估算（6291456）但不低于新估算
+        # （393216 * 8 = 3145728）时仍通过。
+        req = valid_request()
+        req["userOperation"]["maxPriorityFeePerGas"] = "0x1"
+        policy = valid_policy()
+        policy["budgetWei"] = hex(4000000)
+        decision = decision_of(evaluate_sponsorship(req, policy))
+        self.assertEqual(decision["approved"], True)
+        self.assertEqual(decision["reason"], "OK")
 
     def test_inputs_not_mutated(self):
         req = valid_request()
