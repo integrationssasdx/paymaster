@@ -16,6 +16,8 @@
   冲突的批量打包规划。
 - `paymaster.packing.plan_bundle_nonce_chain(document)` 按账户 nonce 链约束
   的批量打包规划。
+- `paymaster.packing.plan_bundle_sender_nonce_chain(document)` 合并 sender
+  配额与 nonce 链约束的批量打包规划。
 """
 
 from paymaster.packing import (
@@ -25,6 +27,7 @@ from paymaster.packing import (
     plan_bundle_nonce_chain,
     plan_bundle_nonce_unique,
     plan_bundle_sender_fair,
+    plan_bundle_sender_nonce_chain,
 )
 from paymaster.sponsorship import evaluate_sponsorship
 from paymaster.validation import validate
@@ -38,5 +41,6 @@ __all__ = [
     "plan_bundle_sender_fair",
     "plan_bundle_nonce_unique",
     "plan_bundle_nonce_chain",
+    "plan_bundle_sender_nonce_chain",
 ]
 __version__ = "0.1.0"
