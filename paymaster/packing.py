@@ -103,11 +103,26 @@ bundlePolicy、senderBudgetPolicy 的顺序校验。approved 项在两条 sender
 突破其 sender 的成本聚合限额记 ``E_SENDER_COST``，否则先突破 bundle gas 记
 ``E_BUNDLE_GAS``，否则记 ``E_BUNDLE_BUDGET``。
 
+``plan_bundle_sender_budget_with_usage`` 在 sender 预算规划上叠加跨批次累
+计用量：文档恰好含五个键，前四个同上，第五个为 ``senderUsage``。
+``senderUsage`` 为对象，键为按规范小写比较的非零地址，值恰好含
+``totalGas`` 与 ``estimatedCostWei``，二者均为无前导零的非负十进制整数字符
+串，表示该 sender 在本批之前的既有累计用量。requests 与三类策略的结构、错
+误码与检查顺序同 ``plan_bundle_sender_budget``；``senderUsage`` 最后校验，
+错误码为 ``E_USAGE_INVALID_FIELD``，path 指向 ``/senderUsage`` 下的根、键
+或字段。approved 项先累计到 ``senderUsage``，再受两条 sender 聚合限额与两
+条 bundle 限额约束求最优子集，优先级与 ``plan_bundle_sender_budget`` 相同
+（先最大化入选数量，再最大化不同 sender 数，再依次减小本批总 gas、总成本，
+最后取下标字典序较小者）。未入选的 approved 请求按并入方案时最先越过的上
+限依次记 ``E_SENDER_GAS``、``E_SENDER_COST``、``E_BUNDLE_GAS``、
+``E_BUNDLE_BUDGET``。空请求、空选择与零累计值均为成功结果。
+
 本模块不验签、不模拟执行、不访问节点、数据库或文件。
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from paymaster.sponsorship import (
@@ -122,8 +137,10 @@ from paymaster.validation import (
     E_INVALID_JSON,
     E_MISSING_FIELD,
     E_UNKNOWN_FIELD,
+    _ADDRESS_RE,
     _MAX_QUANTITY_HEX_DIGITS,
     _QUANTITY_RE,
+    _ZERO_ADDRESS,
     _pointer,
     validate,
 )
@@ -166,6 +183,24 @@ _SENDER_BUDGET_ROOT_FIELDS = (
 
 # senderBudgetPolicy 的必需键，顺序即检查顺序（缺键与字段值均按此顺序报错）。
 _SENDER_BUDGET_POLICY_FIELDS = ("maxTotalGasPerSender", "maxCostWeiPerSender")
+
+# 带累计用量的 sender 预算文档的根对象必需键，顺序即缺键检查顺序。
+_SENDER_BUDGET_USAGE_ROOT_FIELDS = (
+    "requests",
+    "sponsorshipPolicy",
+    "bundlePolicy",
+    "senderBudgetPolicy",
+    "senderUsage",
+)
+
+# senderUsage 每条累计记录的必需键，顺序即检查顺序（缺键与字段值均按此顺序）。
+_USAGE_ENTRY_FIELDS = ("totalGas", "estimatedCostWei")
+
+# senderUsage 校验失败的错误码（根、键、字段值均用此码）。
+E_USAGE_INVALID_FIELD = "E_USAGE_INVALID_FIELD"
+
+# 无前导零的非负十进制整数字符串（"0" 合法）。
+_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 
 
 def _error(code: str, path: str, message: str) -> dict[str, Any]:
@@ -870,6 +905,30 @@ def _choose_sender_budget(
     入选数量最大、不同 sender 数最大、总 gas 较小、总 cost 较小、候选序号序
     列字典序较小。返回 ``(入选候选序号元组, 总gas, 总成本)``。
     """
+    return _choose_sender_budget_with_usage(
+        candidates,
+        {},
+        max_gas_per_sender,
+        max_cost_per_sender,
+        max_total_gas,
+        max_cost_wei,
+    )
+
+
+def _choose_sender_budget_with_usage(
+    candidates: list[tuple[Any, int, int]],
+    usage: dict[Any, tuple[int, int]],
+    max_gas_per_sender: int,
+    max_cost_per_sender: int,
+    max_total_gas: int,
+    max_cost_wei: int,
+) -> tuple[tuple[int, ...], int, int]:
+    """带既有累计用量的 sender 预算选择核心。
+
+    ``usage`` 为 sender -> (已累计 gas, 已累计成本)；各 sender 的可用余量为聚
+    合限额减去既有用量（可为负，此时该 sender 任何正用量项都不可入选，空选
+    择仍可行）。其余与 ``_choose_sender_budget`` 相同。
+    """
     # 按 sender 分组，组内保持候选序号递增；sender 顺序按首次出现。
     groups: dict[Any, list[tuple[int, int, int]]] = {}
     for position, (sender, item_gas, item_cost) in enumerate(candidates):
@@ -881,11 +940,12 @@ def _choose_sender_budget(
     states: dict[tuple[int, int], list[tuple[int, int, tuple[int, ...]]]] = {
         (0, 0): [(0, 0, ())]
     }
-    for items in groups.values():
+    for sender, items in groups.items():
+        used_gas, used_cost = usage.get(sender, (0, 0))
         frontiers = _sender_budget_frontiers(
             items,
-            max_gas_per_sender,
-            max_cost_per_sender,
+            max_gas_per_sender - used_gas,
+            max_cost_per_sender - used_cost,
             max_total_gas,
             max_cost_wei,
         )
@@ -987,6 +1047,243 @@ def plan_bundle_sender_budget(document: Any) -> dict[str, Any]:
     selected = [indices[item] for item in chosen]
     sender_gas: dict[Any, int] = {}
     sender_cost: dict[Any, int] = {}
+    for item in chosen:
+        sender, item_gas, item_cost = candidates[item]
+        sender_gas[sender] = sender_gas.get(sender, 0) + item_gas
+        sender_cost[sender] = sender_cost.get(sender, 0) + item_cost
+
+    for item, (sender, item_gas, item_cost) in enumerate(candidates):
+        if item in chosen_set:
+            continue
+        index = indices[item]
+        if sender_gas.get(sender, 0) + item_gas > max_gas_per_sender:
+            skipped.append({"index": index, "reason": REASON_SENDER_GAS})
+        elif sender_cost.get(sender, 0) + item_cost > max_cost_per_sender:
+            skipped.append({"index": index, "reason": REASON_SENDER_COST})
+        elif chosen_gas + item_gas > max_total_gas:
+            skipped.append({"index": index, "reason": REASON_BUNDLE_GAS})
+        else:
+            # chosen 已达约束下的最大可行数量：sender 两条聚合限额与 bundle
+            # gas 均不超，单独并入必然使 bundle 总成本超限。
+            skipped.append({"index": index, "reason": REASON_BUNDLE_BUDGET})
+
+    return _plan_result(selected, skipped, decisions)
+
+
+def _validate_sender_usage(
+    usage: Any,
+) -> tuple[dict[str, tuple[int, int]] | None, dict[str, Any] | None]:
+    """校验 senderUsage 对象，返回 ({规范sender: (gas, cost)}, None) 或错误。
+
+    检查顺序：根类型，再按插入顺序逐键检查（键为按规范小写比较的非零地
+    址、不重复），每条记录内部为：记录类型、缺键、未知键、字段值（按
+    ``_USAGE_ENTRY_FIELDS`` 顺序）。所有错误的 code 均为
+    ``E_USAGE_INVALID_FIELD``，path 指向 ``/senderUsage`` 下的根、键或字段。
+    """
+    prefix = _pointer("senderUsage")
+    if not isinstance(usage, dict):
+        return None, _error(
+            E_USAGE_INVALID_FIELD, prefix, "senderUsage must be an object"
+        )
+
+    normalized: dict[str, tuple[int, int]] = {}
+    for key, entry in usage.items():
+        key_text = key if isinstance(key, str) else str(key)
+        if (
+            not isinstance(key, str)
+            or not _ADDRESS_RE.match(key)
+            or key.lower() == _ZERO_ADDRESS
+        ):
+            return None, _error(
+                E_USAGE_INVALID_FIELD,
+                prefix + _pointer(key_text),
+                f"invalid sender address key {key_text!r}",
+            )
+        sender = key.lower()
+        if sender in normalized:
+            return None, _error(
+                E_USAGE_INVALID_FIELD,
+                prefix + _pointer(key_text),
+                f"duplicate sender address key {key_text!r}",
+            )
+
+        entry_prefix = prefix + _pointer(key_text)
+        if not isinstance(entry, dict):
+            return None, _error(
+                E_USAGE_INVALID_FIELD,
+                entry_prefix,
+                "usage entry must be an object",
+            )
+        for name in _USAGE_ENTRY_FIELDS:
+            if name not in entry:
+                return None, _error(
+                    E_USAGE_INVALID_FIELD,
+                    entry_prefix + _pointer(name),
+                    f"missing required field {name!r}",
+                )
+        for field in entry:
+            if field not in _USAGE_ENTRY_FIELDS:
+                return None, _error(
+                    E_USAGE_INVALID_FIELD,
+                    entry_prefix + _pointer(field),
+                    f"unknown field {field!r}",
+                )
+        values: dict[str, int] = {}
+        for name in _USAGE_ENTRY_FIELDS:
+            value = entry[name]
+            if not isinstance(value, str) or not _DECIMAL_RE.match(value):
+                return None, _error(
+                    E_USAGE_INVALID_FIELD,
+                    entry_prefix + _pointer(name),
+                    f"invalid decimal value for field {name!r}",
+                )
+            values[name] = int(value)
+        normalized[sender] = (values["totalGas"], values["estimatedCostWei"])
+    return normalized, None
+
+
+def _prepare_sender_budget_with_usage(
+    document: Any,
+) -> tuple[list[Any], Any, int, int, int, int, dict[str, tuple[int, int]]] | dict[
+    str, Any
+]:
+    """校验带累计用量的 sender 预算文档并返回 (requests, sponsorshipPolicy,
+    maxTotalGas, maxCostWei, maxTotalGasPerSender, maxCostWeiPerSender, usage)。
+
+    校验失败时返回错误字典（``ok`` 为 False）。校验次序：根类型、未知键、
+    缺键、requests（逐项）、sponsorshipPolicy、bundlePolicy、
+    senderBudgetPolicy、senderUsage。
+    """
+    if not isinstance(document, dict):
+        return _error(E_INVALID_JSON, "", "document root must be a JSON object")
+
+    for key in document:
+        if key not in _SENDER_BUDGET_USAGE_ROOT_FIELDS:
+            return _error(E_UNKNOWN_FIELD, _pointer(key), f"unknown field {key!r}")
+    for key in _SENDER_BUDGET_USAGE_ROOT_FIELDS:
+        if key not in document:
+            return _error(
+                E_MISSING_FIELD, _pointer(key), f"missing required field {key!r}"
+            )
+
+    requests = document["requests"]
+    if not isinstance(requests, list):
+        return _error(
+            E_INVALID_FIELD, _pointer("requests"), "field 'requests' must be an array"
+        )
+
+    for index, request in enumerate(requests):
+        result = validate(request)
+        if not result["ok"]:
+            error = result["error"]
+            return _error(
+                error["code"],
+                _pointer("requests", str(index)) + error["path"],
+                error["message"],
+            )
+
+    sponsorship_policy, err = _validate_policy(
+        document["sponsorshipPolicy"], _POLICY_FIELDS, "sponsorshipPolicy"
+    )
+    if err is not None:
+        return err
+
+    bundle_policy, err = _validate_policy(
+        document["bundlePolicy"], _BUNDLE_POLICY_FIELDS, "bundlePolicy"
+    )
+    if err is not None:
+        return err
+
+    sender_budget_policy, err = _validate_policy(
+        document["senderBudgetPolicy"],
+        _SENDER_BUDGET_POLICY_FIELDS,
+        "senderBudgetPolicy",
+    )
+    if err is not None:
+        return err
+
+    usage, err = _validate_sender_usage(document["senderUsage"])
+    if err is not None:
+        return err
+    assert sponsorship_policy is not None and bundle_policy is not None
+    assert sender_budget_policy is not None and usage is not None
+
+    return (
+        requests,
+        document["sponsorshipPolicy"],
+        int(bundle_policy["maxTotalGas"], 16),
+        int(bundle_policy["maxCostWei"], 16),
+        int(sender_budget_policy["maxTotalGasPerSender"], 16),
+        int(sender_budget_policy["maxCostWeiPerSender"], 16),
+        usage,
+    )
+
+
+def plan_bundle_sender_budget_with_usage(document: Any) -> dict[str, Any]:
+    """叠加跨批次 sender 累计用量的 sender 预算批量打包规划。
+
+    文档恰好含 ``requests``、``sponsorshipPolicy``、``bundlePolicy``、
+    ``senderBudgetPolicy`` 与 ``senderUsage`` 五个键；``senderUsage`` 的键为
+    按规范小写比较的非零地址，值恰好含 ``totalGas`` 与 ``estimatedCostWei``
+    （无前导零的非负十进制整数字符串），表示该 sender 在本批之前的既有累计
+    用量。approved 请求先累计到 ``senderUsage``，再受两条 sender 聚合限额与
+    两条 bundle 限额约束求最优子集，优先级与
+    ``plan_bundle_sender_budget`` 相同。未入选的 approved 请求只记一个原因：
+    单独并入后先突破其 sender 的 gas 聚合限额（含既有用量）记
+    ``E_SENDER_GAS``，否则先突破其 sender 的成本聚合限额记
+    ``E_SENDER_COST``，否则先突破 bundle gas 记 ``E_BUNDLE_GAS``，否则记
+    ``E_BUNDLE_BUDGET``。空请求、空选择与零累计值均为成功结果。只返回字典，
+    不抛业务异常。
+    """
+    prepared = _prepare_sender_budget_with_usage(document)
+    if isinstance(prepared, dict):
+        return prepared
+    (
+        requests,
+        sponsorship_policy,
+        max_total_gas,
+        max_cost_wei,
+        max_gas_per_sender,
+        max_cost_per_sender,
+        usage,
+    ) = prepared
+
+    decisions = _evaluate_all(requests, sponsorship_policy)
+
+    skipped: list[dict[str, Any]] = []
+    # candidates 按原下标递增压入，平行的 indices 记录原下标；sender 取校验后
+    # 的规范地址（小写），与 senderUsage 规范化后的键一致。
+    candidates: list[tuple[Any, int, int]] = []
+    indices: list[int] = []
+    for index, (request, decision) in enumerate(zip(requests, decisions)):
+        if not decision["approved"]:
+            skipped.append({"index": index, "reason": decision["reason"]})
+            continue
+        # 请求已通过校验，此处取规范 sender 必然成功。
+        sender = validate(request)["normalized"]["userOperation"]["sender"]
+        candidates.append(
+            (
+                sender,
+                int(decision["totalGas"]),
+                int(decision["estimatedCostWei"]),
+            )
+        )
+        indices.append(index)
+
+    chosen, chosen_gas, chosen_cost = _choose_sender_budget_with_usage(
+        candidates,
+        usage,
+        max_gas_per_sender,
+        max_cost_per_sender,
+        max_total_gas,
+        max_cost_wei,
+    )
+
+    chosen_set = set(chosen)
+    selected = [indices[item] for item in chosen]
+    # sender 聚合从既有累计用量起算，再叠加本批入选项。
+    sender_gas = {sender: used_gas for sender, (used_gas, _) in usage.items()}
+    sender_cost = {sender: used_cost for sender, (_, used_cost) in usage.items()}
     for item in chosen:
         sender, item_gas, item_cost = candidates[item]
         sender_gas[sender] = sender_gas.get(sender, 0) + item_gas

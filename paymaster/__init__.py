@@ -20,6 +20,8 @@
   配额与 nonce 链约束的批量打包规划。
 - `paymaster.packing.plan_bundle_sender_budget(document)` 按 sender 聚合 Gas
   与费用预算的批量打包规划。
+- `paymaster.packing.plan_bundle_sender_budget_with_usage(document)` 叠加跨
+  批次 sender 累计用量的 sender 预算批量打包规划。
 """
 
 from paymaster.packing import (
@@ -29,6 +31,7 @@ from paymaster.packing import (
     plan_bundle_nonce_chain,
     plan_bundle_nonce_unique,
     plan_bundle_sender_budget,
+    plan_bundle_sender_budget_with_usage,
     plan_bundle_sender_fair,
     plan_bundle_sender_nonce_chain,
 )
@@ -46,5 +49,6 @@ __all__ = [
     "plan_bundle_nonce_chain",
     "plan_bundle_sender_nonce_chain",
     "plan_bundle_sender_budget",
+    "plan_bundle_sender_budget_with_usage",
 ]
 __version__ = "0.1.0"
