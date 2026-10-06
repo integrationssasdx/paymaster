@@ -117,6 +117,25 @@ bundlePolicy、senderBudgetPolicy 的顺序校验。approved 项在两条 sender
 限依次记 ``E_SENDER_GAS``、``E_SENDER_COST``、``E_BUNDLE_GAS``、
 ``E_BUNDLE_BUDGET``。空请求、空选择与零累计值均为成功结果。
 
+``plan_bundle_sender_budget_with_nonce_state`` 在带累计用量的 sender 预算规
+划上叠加连续批次的 nonce 状态：文档恰好含六个键，前五个同上，第六个为
+``senderNonceState``。``senderNonceState`` 为对象，键为规范（小写）非零
+sender 地址，值为数组；数组项恰好含 ``nonceKey`` 与 ``lastSequence``，二者
+均为无前导零的非负十进制整数字符串且小于 2 的 64 次方，同一 sender 的数组
+内不得重复 ``nonceKey``。requests、三类策略与 ``senderUsage`` 的结构、错误
+码与检查顺序同 ``plan_bundle_sender_budget_with_usage``；
+``senderNonceState`` 最后校验，错误码为 ``E_NONCE_STATE_INVALID_FIELD``，
+path 指向 ``/senderNonceState`` 下的根、键、数组项或字段。approved 请求按
+规范 sender 与 nonce 拆分（nonce 除以 2 的 64 次方，商为 key、余数为
+sequence）归入 (sender, key) 组：有状态的组入选链从 ``lastSequence + 1``
+开始，无状态的组从 0 开始；同组入选项按 requests 下标递增时 sequence 必须
+严格递增且相邻恰好相差 1。在该链约束、两条 sender 聚合限额（含既有用量）
+与两条 bundle 限额下求最优子集，优先级同上。未入选的 approved 请求按次序
+只记一个原因：与最终组重复或不高于 ``lastSequence`` 记
+``E_NONCE_CONFLICT``；不能从正确起点连续接续记 ``E_NONCE_GAP``；随后依次
+记 ``E_SENDER_GAS``、``E_SENDER_COST``、``E_BUNDLE_GAS``、
+``E_BUNDLE_BUDGET``。空请求、空选择与空状态均为成功结果。
+
 本模块不验签、不模拟执行、不访问节点、数据库或文件。
 """
 
@@ -1884,6 +1903,558 @@ def plan_bundle_sender_nonce_chain(document: Any) -> dict[str, Any]:
         else:
             # chosen 已达约束下的最大可行数量：该项不断链、sender 未满且 gas
             # 不超，并入必然使总成本超限。
+            skipped.append({"index": index, "reason": REASON_BUNDLE_BUDGET})
+
+    return _plan_result(selected, skipped, decisions)
+
+
+# 带 nonce 状态的 sender 预算文档的根对象必需键，顺序即缺键检查顺序。
+_SENDER_BUDGET_NONCE_STATE_ROOT_FIELDS = (
+    "requests",
+    "sponsorshipPolicy",
+    "bundlePolicy",
+    "senderBudgetPolicy",
+    "senderUsage",
+    "senderNonceState",
+)
+
+# senderNonceState 每条状态记录的必需键，顺序即检查顺序（缺键与字段值均按此顺序）。
+_NONCE_STATE_ENTRY_FIELDS = ("nonceKey", "lastSequence")
+
+# senderNonceState 校验失败的错误码（根、键、数组项与字段值均用此码）。
+E_NONCE_STATE_INVALID_FIELD = "E_NONCE_STATE_INVALID_FIELD"
+
+# nonceKey 与 lastSequence 的上界：均小于 2 的 64 次方。
+_NONCE_STATE_LIMIT = 1 << 64
+
+# 规范 sender 键：小写十六进制非零地址（大写或混合大小写均非规范形式）。
+_NONCE_STATE_SENDER_RE = re.compile(r"^0x[0-9a-f]{40}$")
+
+
+def _validate_sender_nonce_state(
+    state: Any,
+) -> tuple[dict[str, dict[int, int]] | None, dict[str, Any] | None]:
+    """校验 senderNonceState 对象，返回 ({规范sender: {nonceKey: lastSequence}}, None)
+    或 (None, 错误字典)。
+
+    检查顺序：根类型，再按插入顺序逐键检查（键为规范小写非零地址），每个键的
+    值须为数组，再按下标顺序逐项检查：项类型、缺键、未知键、字段值（按
+    ``_NONCE_STATE_ENTRY_FIELDS`` 顺序，先校验无前导零十进制格式、再校验小于
+    2 的 64 次方），最后检查同 sender 内 nonceKey 不重复。所有错误的 code 均为
+    ``E_NONCE_STATE_INVALID_FIELD``，path 指向 ``/senderNonceState`` 下的根、
+    键、数组项或字段。
+    """
+    prefix = _pointer("senderNonceState")
+    if not isinstance(state, dict):
+        return None, _error(
+            E_NONCE_STATE_INVALID_FIELD, prefix, "senderNonceState must be an object"
+        )
+
+    normalized: dict[str, dict[int, int]] = {}
+    for key, entries in state.items():
+        key_text = key if isinstance(key, str) else str(key)
+        if (
+            not isinstance(key, str)
+            or not _NONCE_STATE_SENDER_RE.match(key)
+            or key == _ZERO_ADDRESS
+        ):
+            return None, _error(
+                E_NONCE_STATE_INVALID_FIELD,
+                prefix + _pointer(key_text),
+                f"invalid sender address key {key_text!r}",
+            )
+
+        entry_prefix = prefix + _pointer(key_text)
+        if not isinstance(entries, list):
+            return None, _error(
+                E_NONCE_STATE_INVALID_FIELD,
+                entry_prefix,
+                "nonce state entries must be an array",
+            )
+
+        sender_state: dict[int, int] = {}
+        for position, entry in enumerate(entries):
+            item_prefix = entry_prefix + _pointer(str(position))
+            if not isinstance(entry, dict):
+                return None, _error(
+                    E_NONCE_STATE_INVALID_FIELD,
+                    item_prefix,
+                    "nonce state entry must be an object",
+                )
+            for name in _NONCE_STATE_ENTRY_FIELDS:
+                if name not in entry:
+                    return None, _error(
+                        E_NONCE_STATE_INVALID_FIELD,
+                        item_prefix + _pointer(name),
+                        f"missing required field {name!r}",
+                    )
+            for field in entry:
+                if field not in _NONCE_STATE_ENTRY_FIELDS:
+                    return None, _error(
+                        E_NONCE_STATE_INVALID_FIELD,
+                        item_prefix + _pointer(field),
+                        f"unknown field {field!r}",
+                    )
+            values: dict[str, int] = {}
+            for name in _NONCE_STATE_ENTRY_FIELDS:
+                value = entry[name]
+                if not isinstance(value, str) or not _DECIMAL_RE.match(value):
+                    return None, _error(
+                        E_NONCE_STATE_INVALID_FIELD,
+                        item_prefix + _pointer(name),
+                        f"invalid decimal value for field {name!r}",
+                    )
+                number = int(value)
+                if number >= _NONCE_STATE_LIMIT:
+                    return None, _error(
+                        E_NONCE_STATE_INVALID_FIELD,
+                        item_prefix + _pointer(name),
+                        f"field {name!r} must be less than 2**64",
+                    )
+                values[name] = number
+            nonce_key = values["nonceKey"]
+            if nonce_key in sender_state:
+                return None, _error(
+                    E_NONCE_STATE_INVALID_FIELD,
+                    item_prefix + _pointer("nonceKey"),
+                    f"duplicate nonceKey for sender {key_text!r}",
+                )
+            sender_state[nonce_key] = values["lastSequence"]
+        normalized[key] = sender_state
+    return normalized, None
+
+
+def _prepare_sender_budget_with_nonce_state(
+    document: Any,
+) -> tuple[
+    list[Any], Any, int, int, int, int, dict[str, tuple[int, int]], dict[str, dict[int, int]]
+] | dict[str, Any]:
+    """校验带 nonce 状态的 sender 预算文档并返回 (requests, sponsorshipPolicy,
+    maxTotalGas, maxCostWei, maxTotalGasPerSender, maxCostWeiPerSender, usage,
+    nonceState)。
+
+    校验失败时返回错误字典（``ok`` 为 False）。校验次序：根类型、未知键、
+    缺键、requests（逐项）、sponsorshipPolicy、bundlePolicy、
+    senderBudgetPolicy、senderUsage、senderNonceState。
+    """
+    if not isinstance(document, dict):
+        return _error(E_INVALID_JSON, "", "document root must be a JSON object")
+
+    for key in document:
+        if key not in _SENDER_BUDGET_NONCE_STATE_ROOT_FIELDS:
+            return _error(E_UNKNOWN_FIELD, _pointer(key), f"unknown field {key!r}")
+    for key in _SENDER_BUDGET_NONCE_STATE_ROOT_FIELDS:
+        if key not in document:
+            return _error(
+                E_MISSING_FIELD, _pointer(key), f"missing required field {key!r}"
+            )
+
+    requests = document["requests"]
+    if not isinstance(requests, list):
+        return _error(
+            E_INVALID_FIELD, _pointer("requests"), "field 'requests' must be an array"
+        )
+
+    for index, request in enumerate(requests):
+        result = validate(request)
+        if not result["ok"]:
+            error = result["error"]
+            return _error(
+                error["code"],
+                _pointer("requests", str(index)) + error["path"],
+                error["message"],
+            )
+
+    sponsorship_policy, err = _validate_policy(
+        document["sponsorshipPolicy"], _POLICY_FIELDS, "sponsorshipPolicy"
+    )
+    if err is not None:
+        return err
+
+    bundle_policy, err = _validate_policy(
+        document["bundlePolicy"], _BUNDLE_POLICY_FIELDS, "bundlePolicy"
+    )
+    if err is not None:
+        return err
+
+    sender_budget_policy, err = _validate_policy(
+        document["senderBudgetPolicy"],
+        _SENDER_BUDGET_POLICY_FIELDS,
+        "senderBudgetPolicy",
+    )
+    if err is not None:
+        return err
+
+    usage, err = _validate_sender_usage(document["senderUsage"])
+    if err is not None:
+        return err
+
+    nonce_state, err = _validate_sender_nonce_state(document["senderNonceState"])
+    if err is not None:
+        return err
+    assert sponsorship_policy is not None and bundle_policy is not None
+    assert sender_budget_policy is not None and usage is not None
+    assert nonce_state is not None
+
+    return (
+        requests,
+        document["sponsorshipPolicy"],
+        int(bundle_policy["maxTotalGas"], 16),
+        int(bundle_policy["maxCostWei"], 16),
+        int(sender_budget_policy["maxTotalGasPerSender"], 16),
+        int(sender_budget_policy["maxCostWeiPerSender"], 16),
+        usage,
+        nonce_state,
+    )
+
+
+def _nonce_state_chain_frontiers(
+    items: list[tuple[int, int, int, int]],
+    start: int,
+    max_gas: int,
+    max_cost: int,
+    max_total_gas: int,
+    max_cost_wei: int,
+) -> list[list[tuple[int, int, tuple[int, ...]]]]:
+    """单个 (sender, key) 组在 nonce 状态下的子集前沿：``dp[k]`` 为恰好选 k 项
+    时的 Pareto 前沿。
+
+    ``items`` 为按候选序号递增的 ``(候选序号, sequence, gas, cost)`` 列表，
+    且只含 sequence 不小于 ``start`` 的项（其余项必为冲突，不参与选择）。与
+    ``_chain_group_frontiers`` 的唯一区别是链必须从 ``start`` 开始：长度为 1
+    的链只由 sequence 恰为 ``start`` 的项开启，延伸规则不变（接 sequence 恰好
+    小 1 且候选序号更小的链）。``max_gas`` 与 ``max_cost`` 为该 sender 的剩余
+    聚合额度，后两个参数为两条 bundle 限额；超限中间点直接丢弃。
+    """
+    size = len(items)
+    ending: list[list[list[tuple[int, int, tuple[int, ...]]]]] = [
+        [[] for _ in range(size + 1)] for _ in range(size)
+    ]
+    dp: list[list[tuple[int, int, tuple[int, ...]]]] = [
+        [] for _ in range(size + 1)
+    ]
+    dp[0] = [(0, 0, ())]
+    for j, (position, sequence, item_gas, item_cost) in enumerate(items):
+        if item_gas > max_gas or item_cost > max_cost:
+            continue  # 单项已超 sender 剩余额度，任何可行方案都不会含它
+        if item_gas > max_total_gas or item_cost > max_cost_wei:
+            continue  # 单项已超 bundle 限额
+        additions: list[list[tuple[int, int, tuple[int, ...]]]] = [
+            [] for _ in range(size + 1)
+        ]
+        if sequence == start:
+            additions[1].append((item_gas, item_cost, (position,)))
+        # 候选序号递增遍历，i < j 即候选序号更小；只接 sequence 恰好小 1 的链。
+        for i in range(j):
+            if items[i][1] != sequence - 1:
+                continue
+            for k in range(1, size):
+                for gas, cost, chosen in ending[i][k]:
+                    new_gas = gas + item_gas
+                    new_cost = cost + item_cost
+                    if new_gas > max_gas or new_cost > max_cost:
+                        continue
+                    if new_gas > max_total_gas or new_cost > max_cost_wei:
+                        continue
+                    additions[k + 1].append(
+                        (new_gas, new_cost, chosen + (position,))
+                    )
+        for k in range(1, size + 1):
+            if not additions[k]:
+                continue
+            ending[j][k] = _prune_frontier(additions[k])
+            dp[k] = _prune_frontier(dp[k] + ending[j][k])
+    return dp
+
+
+def _sender_nonce_state_frontiers(
+    items: list[tuple[int, int, int, int, int]],
+    starts: dict[int, int],
+    max_gas: int,
+    max_cost: int,
+    max_total_gas: int,
+    max_cost_wei: int,
+) -> list[list[tuple[int, int, tuple[int, ...]]]]:
+    """单个 sender 的子集前沿：``dp[k]`` 为该 sender 恰好选 k 项时的前沿。
+
+    ``items`` 为按候选序号递增的 ``(候选序号, key, sequence, gas, cost)`` 列
+    表（已过滤 sequence 小于各组起点的项），``starts`` 为该 sender 各 key 组
+    的起点 sequence。各 key 组内为从起点开始的连续链，跨 key 归并（不同 key
+    相互独立），该 sender 入选项总 gas 不超过 ``max_gas``、总成本不超过
+    ``max_cost``（均为扣除既有用量后的剩余额度），同时不超两条 bundle 限额。
+    """
+    # 按 key 归组，组内保持候选序号递增；组顺序按首次出现。
+    chain_groups: dict[int, list[tuple[int, int, int, int]]] = {}
+    for position, key, sequence, item_gas, item_cost in items:
+        chain_groups.setdefault(key, []).append(
+            (position, sequence, item_gas, item_cost)
+        )
+
+    size = len(items)
+    dp: list[list[tuple[int, int, tuple[int, ...]]]] = [
+        [] for _ in range(size + 1)
+    ]
+    dp[0] = [(0, 0, ())]
+    for key, group in chain_groups.items():
+        frontiers = _nonce_state_chain_frontiers(
+            group,
+            starts[key],
+            max_gas,
+            max_cost,
+            max_total_gas,
+            max_cost_wei,
+        )
+        merged: dict[int, list[tuple[int, int, tuple[int, ...]]]] = {}
+        for taken in range(size + 1):
+            if not dp[taken]:
+                continue
+            for add, frontier in enumerate(frontiers):
+                if not frontier or taken + add > size:
+                    continue
+                additions = merged.setdefault(taken + add, [])
+                for gas, cost, chosen in dp[taken]:
+                    for add_gas, add_cost, add_chosen in frontier:
+                        new_gas = gas + add_gas
+                        new_cost = cost + add_cost
+                        # 空选择恒可行（剩余额度可能为负）；非空选择才受
+                        # sender 剩余聚合额度约束。
+                        if taken + add > 0 and (
+                            new_gas > max_gas or new_cost > max_cost
+                        ):
+                            continue
+                        if new_gas > max_total_gas or new_cost > max_cost_wei:
+                            continue
+                        additions.append(
+                            (new_gas, new_cost, tuple(sorted(chosen + add_chosen)))
+                        )
+        new_dp: list[list[tuple[int, int, tuple[int, ...]]]] = [
+            [] for _ in range(size + 1)
+        ]
+        for taken in range(size + 1):
+            if merged.get(taken):
+                new_dp[taken] = _prune_frontier(merged[taken])
+        dp = new_dp
+    return dp
+
+
+def _choose_sender_budget_with_nonce_state(
+    candidates: list[tuple[Any, int, int, int, int]],
+    usage: dict[Any, tuple[int, int]],
+    starts: dict[tuple[Any, int], int],
+    max_gas_per_sender: int,
+    max_cost_per_sender: int,
+    max_total_gas: int,
+    max_cost_wei: int,
+) -> tuple[tuple[int, ...], int, int]:
+    """在 nonce 状态链约束、sender 聚合限额（含既有用量）与两条 bundle 限额下
+    求最优入选子集。
+
+    ``candidates`` 为按原下标递增的 ``(sender, key, sequence, gas, cost)``
+    列表，只含 sequence 不小于所在组起点的项；``usage`` 为 sender -> (已累
+    计 gas, 已累计成本)；``starts`` 为 (sender, key) -> 起点 sequence（有状
+    态为 lastSequence + 1，无状态为 0）。目标依次：入选数量最大、不同
+    sender 数最大、总 gas 较小、总 cost 较小、候选序号序列字典序较小。返回
+    ``(入选候选序号元组, 总gas, 总成本)``。
+    """
+    # 按 sender 分组，组内保持候选序号递增；sender 顺序按首次出现。
+    groups: dict[Any, list[tuple[int, int, int, int, int]]] = {}
+    for position, (sender, key, sequence, item_gas, item_cost) in enumerate(
+        candidates
+    ):
+        groups.setdefault(sender, []).append(
+            (position, key, sequence, item_gas, item_cost)
+        )
+
+    # 状态 (入选数, 不同 sender 数) -> (gas, cost, 候选序号元组) 的 Pareto
+    # 前沿，与 _choose_sender_budget_with_usage 的跨 sender 归并同构：被支配
+    # 点不可能反超，同 (gas, cost) 时序号元组字典序在有序归并下保持。
+    states: dict[tuple[int, int], list[tuple[int, int, tuple[int, ...]]]] = {
+        (0, 0): [(0, 0, ())]
+    }
+    for sender, items in groups.items():
+        used_gas, used_cost = usage.get(sender, (0, 0))
+        sender_starts = {
+            key: starts[(sender, key)] for _, key, _, _, _ in items
+        }
+        frontiers = _sender_nonce_state_frontiers(
+            items,
+            sender_starts,
+            max_gas_per_sender - used_gas,
+            max_cost_per_sender - used_cost,
+            max_total_gas,
+            max_cost_wei,
+        )
+        merged_states: dict[
+            tuple[int, int], list[tuple[int, int, tuple[int, ...]]]
+        ] = {}
+        for (count, sender_count), points in states.items():
+            for taken, frontier in enumerate(frontiers):
+                if not frontier:
+                    continue
+                state_key = (count + taken, sender_count + (1 if taken > 0 else 0))
+                additions = merged_states.setdefault(state_key, [])
+                for gas, cost, chosen in points:
+                    for add_gas, add_cost, add_chosen in frontier:
+                        new_gas = gas + add_gas
+                        new_cost = cost + add_cost
+                        if new_gas > max_total_gas or new_cost > max_cost_wei:
+                            continue
+                        additions.append(
+                            (new_gas, new_cost, tuple(sorted(chosen + add_chosen)))
+                        )
+        states = {
+            state_key: _prune_frontier(points)
+            for state_key, points in merged_states.items()
+        }
+
+    # 前沿按 (gas, cost, 序号元组) 升序，首元素即该状态的最优点。
+    best_key: tuple[Any, ...] | None = None
+    best: tuple[tuple[int, ...], int, int] = ((), 0, 0)
+    for (count, sender_count), frontier in states.items():
+        if not frontier:
+            continue
+        gas, cost, chosen = frontier[0]
+        state_sort_key = (-count, -sender_count, gas, cost, chosen)
+        if best_key is None or state_sort_key < best_key:
+            best_key = state_sort_key
+            best = (chosen, gas, cost)
+    return best
+
+
+def plan_bundle_sender_budget_with_nonce_state(document: Any) -> dict[str, Any]:
+    """叠加连续批次 nonce 状态的 sender 预算批量打包规划。
+
+    文档恰好含 ``requests``、``sponsorshipPolicy``、``bundlePolicy``、
+    ``senderBudgetPolicy``、``senderUsage`` 与 ``senderNonceState`` 六个键；
+    前五个键的规则同 ``plan_bundle_sender_budget_with_usage``。
+    ``senderNonceState`` 的键为规范（小写）非零 sender 地址，值为数组，数组
+    项恰好含 ``nonceKey`` 与 ``lastSequence``（无前导零的非负十进制整数字符
+    串，均小于 2 的 64 次方），同一 sender 内 nonceKey 不重复；校验失败一律
+    记 ``E_NONCE_STATE_INVALID_FIELD``，path 指向 ``/senderNonceState`` 下的
+    出错位置。approved 请求按规范 sender 与 nonce 拆分（商为 key、余数为
+    sequence）归入 (sender, key) 组：有状态的组入选链从 ``lastSequence + 1``
+    开始，无状态的组从 0 开始；同组入选项按 requests 下标递增时 sequence 严
+    格递增且相邻恰好相差 1。在该链约束、两条 sender 聚合限额（含既有用量）
+    与两条 bundle 限额下求最优子集：先最大化入选数量，再最大化不同 sender
+    数，之后依次取总 ``totalGas`` 较小、总 ``estimatedCostWei`` 较小、
+    ``selected`` 下标序列字典序较小的唯一方案。未入选的 approved 请求按次序
+    只记一个原因：与最终组重复或不高于 ``lastSequence`` 记
+    ``E_NONCE_CONFLICT``；不能从正确起点连续接续记 ``E_NONCE_GAP``；否则单
+    独并入后先突破其 sender 的 gas 聚合限额记 ``E_SENDER_GAS``，否则先突破
+    其 sender 的成本聚合限额记 ``E_SENDER_COST``，否则先突破 bundle gas 记
+    ``E_BUNDLE_GAS``，否则记 ``E_BUNDLE_BUDGET``。空请求、空选择与空状态均
+    为成功结果。只返回字典，不抛业务异常。
+    """
+    prepared = _prepare_sender_budget_with_nonce_state(document)
+    if isinstance(prepared, dict):
+        return prepared
+    (
+        requests,
+        sponsorship_policy,
+        max_total_gas,
+        max_cost_wei,
+        max_gas_per_sender,
+        max_cost_per_sender,
+        usage,
+        nonce_state,
+    ) = prepared
+
+    decisions = _evaluate_all(requests, sponsorship_policy)
+
+    skipped: list[dict[str, Any]] = []
+    # candidates 按原下标递增压入，平行的 indices 记录原下标；sender 取校验后
+    # 的规范地址（小写），nonce 取规范 quantity 的整数值再拆分 key/sequence，
+    # 故大小写或前导零差异不产生新键。sequence 不高于 lastSequence 的项不可
+    # 能进入任何可行方案，直接记 E_NONCE_CONFLICT，不参与选择也不占额度。
+    candidates: list[tuple[Any, int, int, int, int]] = []
+    indices: list[int] = []
+    for index, (request, decision) in enumerate(zip(requests, decisions)):
+        if not decision["approved"]:
+            skipped.append({"index": index, "reason": decision["reason"]})
+            continue
+        # 请求已通过校验，此处取规范 sender/nonce 必然成功。
+        user_op = validate(request)["normalized"]["userOperation"]
+        sender = user_op["sender"]
+        nonce = int(user_op["nonce"], 16)
+        key = nonce // _NONCE_SEQUENCE_MOD
+        sequence = nonce % _NONCE_SEQUENCE_MOD
+        last_sequence = nonce_state.get(sender, {}).get(key)
+        if last_sequence is not None and sequence <= last_sequence:
+            skipped.append({"index": index, "reason": REASON_NONCE_CONFLICT})
+            continue
+        candidates.append(
+            (
+                sender,
+                key,
+                sequence,
+                int(decision["totalGas"]),
+                int(decision["estimatedCostWei"]),
+            )
+        )
+        indices.append(index)
+
+    # 各 (sender, key) 组的起点：有状态为 lastSequence + 1，无状态为 0。
+    starts: dict[tuple[Any, int], int] = {}
+    for sender, key, _, _, _ in candidates:
+        if (sender, key) not in starts:
+            last_sequence = nonce_state.get(sender, {}).get(key)
+            starts[(sender, key)] = (
+                last_sequence + 1 if last_sequence is not None else 0
+            )
+
+    chosen, chosen_gas, _ = _choose_sender_budget_with_nonce_state(
+        candidates,
+        usage,
+        starts,
+        max_gas_per_sender,
+        max_cost_per_sender,
+        max_total_gas,
+        max_cost_wei,
+    )
+
+    chosen_set = set(chosen)
+    selected = [indices[item] for item in chosen]
+    # sender 聚合从既有累计用量起算，再叠加本批入选项。
+    sender_gas = {sender: used_gas for sender, (used_gas, _) in usage.items()}
+    sender_cost = {sender: used_cost for sender, (_, used_cost) in usage.items()}
+    # 每个 (sender, key) 组最终入选的 sequence -> 候选序号，用于判断落选项
+    # 是重复 sequence 还是不能从正确起点连续接续。
+    chosen_sequences: dict[tuple[Any, int], dict[int, int]] = {}
+    for item in chosen:
+        sender, key, sequence, item_gas, item_cost = candidates[item]
+        sender_gas[sender] = sender_gas.get(sender, 0) + item_gas
+        sender_cost[sender] = sender_cost.get(sender, 0) + item_cost
+        chosen_sequences.setdefault((sender, key), {})[sequence] = item
+
+    for item, (sender, key, sequence, item_gas, item_cost) in enumerate(candidates):
+        if item in chosen_set:
+            continue
+        index = indices[item]
+        start = starts[(sender, key)]
+        sequences = chosen_sequences.get((sender, key), {})
+        if sequence in sequences:
+            # 冲突先于断链与各类限额。
+            skipped.append({"index": index, "reason": REASON_NONCE_CONFLICT})
+            continue
+        # 入选链的 sequence 恰为 start..start+len-1 的连续区间；该项 sequence
+        # 不小于 start 且未入选，故 sequence >= start + len。并入后仍为从起点
+        # 开始的连续链当且仅当该项恰好接在链尾，且候选序号（与原下标同序）
+        # 在链尾之后。
+        chain_length = len(sequences)
+        extends = sequence == start + chain_length and (
+            chain_length == 0 or item > sequences[start + chain_length - 1]
+        )
+        if not extends:
+            skipped.append({"index": index, "reason": REASON_NONCE_GAP})
+        elif sender_gas.get(sender, 0) + item_gas > max_gas_per_sender:
+            skipped.append({"index": index, "reason": REASON_SENDER_GAS})
+        elif sender_cost.get(sender, 0) + item_cost > max_cost_per_sender:
+            skipped.append({"index": index, "reason": REASON_SENDER_COST})
+        elif chosen_gas + item_gas > max_total_gas:
+            skipped.append({"index": index, "reason": REASON_BUNDLE_GAS})
+        else:
+            # chosen 已达约束下的最大可行数量：该项可接续且 sender 两条聚合限
+            # 额与 bundle gas 均不超，单独并入必然使 bundle 总成本超限。
             skipped.append({"index": index, "reason": REASON_BUNDLE_BUDGET})
 
     return _plan_result(selected, skipped, decisions)

@@ -17,7 +17,7 @@ ERC-4337 账户抽象服务：UserOperation 校验、Gas 代付与打包策略�
 ```python
 from paymaster.validation import validate
 from paymaster.sponsorship import evaluate_sponsorship
-from paymaster.packing import plan_bundle, plan_bundle_max_count, plan_bundle_sender_fair, plan_bundle_nonce_unique, plan_bundle_nonce_chain, plan_bundle_sender_nonce_chain, plan_bundle_sender_budget, plan_bundle_sender_budget_with_usage
+from paymaster.packing import plan_bundle, plan_bundle_max_count, plan_bundle_sender_fair, plan_bundle_nonce_unique, plan_bundle_nonce_chain, plan_bundle_sender_nonce_chain, plan_bundle_sender_budget, plan_bundle_sender_budget_with_usage, plan_bundle_sender_budget_with_nonce_state
 
 result = validate(request)  # request 为已解析的 JSON 值，只返回字典，不抛业务异常
 decision = evaluate_sponsorship(request, policy)  # 先走 validate，再评估代付
@@ -29,6 +29,7 @@ plan = plan_bundle_nonce_chain(document)  # 按账户 nonce 链约束的批量�
 plan = plan_bundle_sender_nonce_chain(document)  # 合并 sender 配额与 nonce 链的批量打包
 plan = plan_bundle_sender_budget(document)  # 按 sender 聚合 Gas 与费用预算的批量打包
 plan = plan_bundle_sender_budget_with_usage(document)  # 叠加跨批次 sender 累计用量的 sender 预算打包
+plan = plan_bundle_sender_budget_with_nonce_state(document)  # 再叠加连续批次 nonce 状态的 sender 预算打包
 ```
 
 命令行（从标准输入读 JSON，只向标准输出写一个 JSON 文档；结果 `ok` 为 true 退出 0，否则退出 1）：
@@ -45,6 +46,7 @@ python -m paymaster.pack_nonce_chain < bundle.json  # 按账户 nonce 链约束�
 python -m paymaster.pack_sender_nonce_chain < bundle.json  # 合并 sender 配额与 nonce 链打包
 python -m paymaster.pack_sender_budget < bundle.json  # 按 sender 聚合 Gas 与费用预算打包
 python -m paymaster.pack_sender_budget_with_usage < bundle.json  # 叠加跨批次 sender 累计用量的 sender 预算打包
+python -m paymaster.pack_sender_budget_with_nonce_state < bundle.json  # 再叠加连续批次 nonce 状态的 sender 预算打包
 ```
 
 ### 请求格式
@@ -110,6 +112,8 @@ python -m paymaster.pack_sender_budget_with_usage < bundle.json  # 叠加跨批�
 `plan_bundle_sender_budget(document)` 的 `document` 恰好含 `requests`、`sponsorshipPolicy`、`bundlePolicy`、`senderBudgetPolicy` 四个键；`senderBudgetPolicy` 恰好含 `maxTotalGasPerSender` 与 `maxCostWeiPerSender`，均为规范 quantity 且大于 0，分别限制同一 sender（地址按规范小写比较）所有入选项的总 `totalGas` 与总 `estimatedCostWei`。校验次序、错误码与结果结构沿用上述约定，策略按 `sponsorshipPolicy`、`bundlePolicy`、`senderBudgetPolicy` 的顺序校验，新策略的错误 path 指向 `/senderBudgetPolicy` 下的字段。approved 请求在两条 sender 聚合限额与两条 bundle 限额下求最优子集：先最大化入选数量，再最大化不同 sender 数，之后依次取总 `totalGas` 较小、总 `estimatedCostWei` 较小、`selected` 下标序列字典序较小的唯一方案。最终方案确定后，每个未入选的 approved 请求单独并入该组并只记一个原因：先使其 sender 聚合总 gas 超限记 `E_SENDER_GAS`；否则先使其 sender 聚合总成本超限记 `E_SENDER_COST`；否则先使 bundle 总 gas 超限记 `E_BUNDLE_GAS`；否则记 `E_BUNDLE_BUDGET`。`approved` 为 false 的请求不参与选择，按原 index 在 `skipped` 中保留 `E_GAS_LIMIT` 或 `E_BUDGET`。`requests` 为空或最终无入选也是成功结果。命令行为 `python -m paymaster.pack_sender_budget`，标准输入输出与退出码约定同上。
 
 `plan_bundle_sender_budget_with_usage(document)` 在 sender 预算规划上叠加跨批次累计用量：`document` 恰好含 `requests`、`sponsorshipPolicy`、`bundlePolicy`、`senderBudgetPolicy`、`senderUsage` 五个键。`senderUsage` 为对象，键为按规范小写比较的非零地址，值恰好含 `totalGas` 与 `estimatedCostWei`，二者均为无前导零的非负十进制整数字符串（`"0"` 合法），表示该 sender 在本批之前的既有累计用量。requests 与三类策略的结构、错误码与检查顺序同 `plan_bundle_sender_budget`；`senderUsage` 最后校验，错误码为 `E_USAGE_INVALID_FIELD`，path 指向 `/senderUsage` 下的根、键或字段。approved 请求先累计到 `senderUsage`，再受两条 sender 聚合限额与两条 bundle 限额约束求最优子集，优先级与 `plan_bundle_sender_budget` 相同（先最大化入选数量，再最大化不同 sender 数，再依次减小本批总 `totalGas`、总 `estimatedCostWei`，最后取 `selected` 下标序列字典序较小者）。每个未入选的 approved 请求只记一个原因：单独并入后先突破其 sender 的 gas 聚合限额（含既有用量）记 `E_SENDER_GAS`；否则先突破其 sender 的成本聚合限额记 `E_SENDER_COST`；否则先使 bundle 总 gas 超限记 `E_BUNDLE_GAS`；否则记 `E_BUNDLE_BUDGET`。`approved` 为 false 的请求不参与选择也不占额度，按原 index 在 `skipped` 中保留其 reason。空请求、空选择与零累计值均为成功结果。命令行为 `python -m paymaster.pack_sender_budget_with_usage`，标准输入输出与退出码约定同上。
+
+`plan_bundle_sender_budget_with_nonce_state(document)` 在带累计用量的 sender 预算规划上叠加连续批次的 nonce 状态：`document` 恰好含 `requests`、`sponsorshipPolicy`、`bundlePolicy`、`senderBudgetPolicy`、`senderUsage`、`senderNonceState` 六个键。`senderNonceState` 为对象，键为规范（小写）非零 sender 地址，值为数组；数组项恰好含 `nonceKey` 与 `lastSequence`，二者均为无前导零的非负十进制整数字符串且小于 2 的 64 次方，同一 sender 的数组内不得重复 `nonceKey`。requests、三类策略与 `senderUsage` 的结构、错误码与检查顺序同 `plan_bundle_sender_budget_with_usage`；`senderNonceState` 最后校验，错误码为 `E_NONCE_STATE_INVALID_FIELD`，path 指向 `/senderNonceState` 下的根、键、数组项或字段。approved 请求按规范化结果分组：`sender` 取规范小写地址，`nonce` 取规范 quantity 的整数值，除以 2 的 64 次方的商为 key、余数为 sequence。同一 (sender, key) 组的入选链必须从状态起点开始：有状态的组从 `lastSequence + 1` 开始，无状态的组从 0 开始；入选项按 requests 下标递增检查时 sequence 必须严格递增且相邻恰好相差 1。sequence 不高于 `lastSequence` 的 approved 请求不可能入选，直接记 `E_NONCE_CONFLICT`，不参与选择也不占额度。在该链约束、两条 sender 聚合限额（含既有用量）与两条 bundle 限额下求最优子集，优先级与 `plan_bundle_sender_budget_with_usage` 相同。每个未入选的 approved 请求按次序只记一个原因：与最终组同 sender、key、sequence 重复或不高于 `lastSequence` 记 `E_NONCE_CONFLICT`；不能从正确起点连续接续记 `E_NONCE_GAP`；否则单独并入后先突破其 sender 的 gas 聚合限额记 `E_SENDER_GAS`；否则先突破其 sender 的成本聚合限额记 `E_SENDER_COST`；否则先使 bundle 总 gas 超限记 `E_BUNDLE_GAS`；否则记 `E_BUNDLE_BUDGET`。`approved` 为 false 的请求不参与选择也不占额度，按原 index 在 `skipped` 中保留其 reason。空请求、空选择与空状态均为成功结果。命令行为 `python -m paymaster.pack_sender_budget_with_nonce_state`，标准输入输出与退出码约定同上。
 
 ## 测试
 
