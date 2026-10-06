@@ -20,6 +20,7 @@ from paymaster.sponsorship import evaluate_sponsorship
 from paymaster.packing import plan_bundle, plan_bundle_max_count, plan_bundle_sender_fair, plan_bundle_nonce_unique, plan_bundle_nonce_chain, plan_bundle_sender_nonce_chain, plan_bundle_sender_budget, plan_bundle_sender_budget_with_usage, plan_bundle_sender_budget_with_nonce_state
 from paymaster.batch_state import advance_batch_state
 from paymaster.batch_sequence import plan_batch_sequence
+from paymaster.batch_sequence_sender_fair import plan_batch_sequence_sender_fair
 
 result = validate(request)  # request 为已解析的 JSON 值，只返回字典，不抛业务异常
 decision = evaluate_sponsorship(request, policy)  # 先走 validate，再评估代付
@@ -34,6 +35,7 @@ plan = plan_bundle_sender_budget_with_usage(document)  # 叠加跨批次 sender 
 plan = plan_bundle_sender_budget_with_nonce_state(document)  # 叠加跨批次 sender 累计用量与 nonce 状态的 sender 预算打包
 result = advance_batch_state(document)  # 与上述规划同校验同方案，额外结转 nextSenderUsage 与 nextSenderNonceState
 result = plan_batch_sequence(document)  # 增加 batchPolicy，把入选项按序分入多个 bundle 并结转状态
+result = plan_batch_sequence_sender_fair(document)  # 再增 fairnessPolicy，限制每 bundle 内同一 sender 入选数并结转状态
 ```
 
 命令行（从标准输入读 JSON，只向标准输出写一个 JSON 文档；结果 `ok` 为 true 退出 0，否则退出 1）：
@@ -53,6 +55,7 @@ python -m paymaster.pack_sender_budget_with_usage < bundle.json  # 叠加跨批�
 python -m paymaster.pack_sender_budget_with_nonce_state < bundle.json  # 叠加跨批次 sender 累计用量与 nonce 状态的 sender 预算打包
 python -m paymaster.batch_state < bundle.json  # 同校验同方案，并结转纯内存批次状态
 python -m paymaster.batch_sequence < sequence.json  # 多批次规划，并结转纯内存批次状态
+python -m paymaster.batch_sequence_sender_fair < sequence_sender_fair.json  # 多批次 sender 公平规划，并结转纯内存批次状态
 ```
 
 ### 请求格式
@@ -139,6 +142,14 @@ python -m paymaster.batch_sequence < sequence.json  # 多批次规划，并结�
 入选项按原下标顺序划分为不超过 `maxBatchCount` 个非空批次，每批不超过 `maxOperationsPerBatch` 项且满足 `bundlePolicy` 两条限额；入选项受计入 `senderUsage` 的两条 sender 聚合限额约束，nonce 以 `senderNonceState` 为锚点按 (sender, nonceKey) 连续递增、跨批不重置。最优目标依次：入选数量最大、批次数最小、不同 sender 数最大、总 `totalGas` 较小、总 `estimatedCostWei` 较小、`selected` 下标序列字典序最小；批次划分取贪心最长前缀（最小批次数划分中唯一确定者）。
 
 成功结果顶层键固定为 `ok`、`plan`、`nextSenderUsage`、`nextSenderNonceState`：`plan` 顶层沿用 `plan_bundle` 的汇总字段（`selected`、`skipped`、`operationCount`、`totalGas`、`estimatedCostWei`）并增加 `batches`（按序排列，每批含 `selected` 与同样的汇总字段）；`skipped` 对未入选项只记一个原因——未代付沿用 `E_GAS_LIMIT` 或 `E_BUDGET`，已批准未入选记 `E_NOT_SELECTED`。`nextSenderUsage` 与 `nextSenderNonceState` 按 `advance_batch_state` 的规则结转全部入选项。空请求与空选择均为成功结果（`batches` 为空数组）。函数不改入参、不落盘、不访问外部系统，只返回字典且不抛业务异常。命令行为 `python -m paymaster.batch_sequence`，标准输入输出、退出码与 `E_INVALID_JSON` 约定同上。
+
+### 多批次 sender 公平规划
+
+`plan_batch_sequence_sender_fair(document)` 在多批次规划上新增 sender 分批公平：`document` 恰好含八个键——`plan_batch_sequence` 的七个键（语义、校验顺序、错误码与 JSON Pointer 路径不变；根级缺键、未知键仍返回 `E_MISSING_FIELD`、`E_UNKNOWN_FIELD`）与 `fairnessPolicy`。`fairnessPolicy` 在 `batchPolicy` 之后最后校验，恰好含 `maxPerSenderPerBatch`，为无前导零、大于 0 且不超过 2 的 64 次方减 1 的规范 quantity，限制每个 bundle（批次）内同一规范 sender（小写地址）的入选数量；跨批配额不共享、随另起新批重置。缺键、未知键、非法类型或值依次返回 `E_FAIRNESS_POLICY_MISSING_FIELD`、`E_FAIRNESS_POLICY_UNKNOWN_FIELD`、`E_FAIRNESS_POLICY_INVALID_FIELD`，path 指向 `/fairnessPolicy` 或其字段。
+
+请求校验、代付通过后，沿用计入 `senderUsage` 的两条 sender 聚合限额、以 `senderNonceState` 为锚点且跨批不重置的 nonce 连续链、`bundlePolicy` 两条限额与 `batchPolicy` 的批次数、每批项数上限，并叠加每 bundle 的 sender 入选上限选出并分批。最优目标依次：入选数量最大、批次数最小、不同 sender 数最大、总 `totalGas` 较小、总 `estimatedCostWei` 较小、`selected` 下标序列字典序最小；批次划分取满足全部上限的贪心最长前缀（最小批次数划分中唯一确定者）。
+
+成功结果的顶层键、`plan` 结构（含汇总与 `batches`）、`skipped` 原因（未代付为 `E_GAS_LIMIT` 或 `E_BUDGET`，已批准未入选为 `E_NOT_SELECTED`）、`nextSenderUsage` 与 `nextSenderNonceState` 的结转规则，以及空输入与空选择行为均与 `plan_batch_sequence` 完全相同。函数不改入参、不落盘、不访问外部系统，只返回字典且不抛业务异常。命令行为 `python -m paymaster.batch_sequence_sender_fair`，标准输入输出、退出码与 `E_INVALID_JSON`（path 为空）约定同上。
 
 
 ## 测试

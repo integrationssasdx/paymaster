@@ -28,6 +28,9 @@
   结转纯内存批次状态（nextSenderUsage 与 nextSenderNonceState）。
 - `paymaster.batch_sequence.plan_batch_sequence(document)` 多批次打包规划：
   在六字段文档上增加 batchPolicy，把入选项按序分入多个 bundle 并结转状态。
+- `paymaster.batch_sequence_sender_fair.plan_batch_sequence_sender_fair(document)`
+  多批次 sender 公平打包规划：在多批次规划上增加 fairnessPolicy，限制每个
+  bundle 内同一 sender 的入选数。
 """
 
 from paymaster.packing import (
@@ -60,6 +63,7 @@ __all__ = [
     "plan_bundle_sender_budget_with_nonce_state",
     "advance_batch_state",
     "plan_batch_sequence",
+    "plan_batch_sequence_sender_fair",
 ]
 
 
@@ -74,6 +78,12 @@ def __getattr__(name: str):
         from paymaster.batch_sequence import plan_batch_sequence
 
         return plan_batch_sequence
+    if name == "plan_batch_sequence_sender_fair":
+        from paymaster.batch_sequence_sender_fair import (
+            plan_batch_sequence_sender_fair,
+        )
+
+        return plan_batch_sequence_sender_fair
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
