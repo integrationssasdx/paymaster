@@ -19,6 +19,7 @@ from paymaster.validation import validate
 from paymaster.sponsorship import evaluate_sponsorship
 from paymaster.packing import plan_bundle, plan_bundle_max_count, plan_bundle_sender_fair, plan_bundle_nonce_unique, plan_bundle_nonce_chain, plan_bundle_sender_nonce_chain, plan_bundle_sender_budget, plan_bundle_sender_budget_with_usage, plan_bundle_sender_budget_with_nonce_state
 from paymaster.batch_state import advance_batch_state
+from paymaster.batch_sequence import plan_batch_sequence
 
 result = validate(request)  # request 为已解析的 JSON 值，只返回字典，不抛业务异常
 decision = evaluate_sponsorship(request, policy)  # 先走 validate，再评估代付
@@ -32,6 +33,7 @@ plan = plan_bundle_sender_budget(document)  # 按 sender 聚合 Gas 与费用预
 plan = plan_bundle_sender_budget_with_usage(document)  # 叠加跨批次 sender 累计用量的 sender 预算打包
 plan = plan_bundle_sender_budget_with_nonce_state(document)  # 叠加跨批次 sender 累计用量与 nonce 状态的 sender 预算打包
 result = advance_batch_state(document)  # 与上述规划同校验同方案，额外结转 nextSenderUsage 与 nextSenderNonceState
+plan = plan_batch_sequence(document)  # 多批次规划，按序分入多个 bundle 并结转下轮 sender 用量与 nonce 状态
 ```
 
 命令行（从标准输入读 JSON，只向标准输出写一个 JSON 文档；结果 `ok` 为 true 退出 0，否则退出 1）：
@@ -50,6 +52,7 @@ python -m paymaster.pack_sender_budget < bundle.json  # 按 sender 聚合 Gas �
 python -m paymaster.pack_sender_budget_with_usage < bundle.json  # 叠加跨批次 sender 累计用量的 sender 预算打包
 python -m paymaster.pack_sender_budget_with_nonce_state < bundle.json  # 叠加跨批次 sender 累计用量与 nonce 状态的 sender 预算打包
 python -m paymaster.batch_state < bundle.json  # 同校验同方案，并结转纯内存批次状态
+python -m paymaster.batch_sequence < bundle.json  # 多批次规划，按序分入多个 bundle 并结转状态状态
 ```
 
 ### 请求格式
@@ -128,6 +131,25 @@ python -m paymaster.batch_state < bundle.json  # 同校验同方案，并结转�
 - `nextSenderNonceState` 保留输入的每个 sender 与每个 `nonceKey` 项；有入选时把该 sender 与 `nonceKey` 项的 `lastSequence` 更新为该组入选 sequence 的最大值（入选项从旧 `lastSequence` 加 1 连续接续，故最大值即新的链尾），缺项（输入中没有的 sender 或 `nonceKey`）同结构新增。各 sender 的 `nonceKey` 项按数值升序排列；`nextSenderUsage` 与 `nextSenderNonceState` 的 sender 键按规范小写地址升序排列，同一地址只出现一次。
 
 函数不改入参，保持请求校验、代付、最优打包、`skipped` 原因与空请求行为；只返回字典且不抛业务异常。命令行为 `python -m paymaster.batch_state`，从标准输入读 JSON、只向标准输出写一个 JSON 文档，成功退出 0、失败退出 1；标准输入不是合法 JSON 时输出 `E_INVALID_JSON` 结果（path 为空）。
+
+### 多批次规划与状态结转
+
+`plan_batch_sequence(document)` 在单批状态结转基线上做多个 bundle 的规划：`document` 恰好含 `requests`、`sponsorshipPolicy`、`bundlePolicy`、`senderBudgetPolicy`、`senderUsage`、`senderNonceState`、`batchPolicy` 七个键，前六项的结构、语义、错误码与检查顺序与 `plan_bundle_sender_budget_with_nonce_state` 完全相同；`batchPolicy` 最后校验。
+
+`batchPolicy` 恰好含 `maxBatchCount` 与 `maxOperationsPerBatch`：检查顺序为根类型、缺键、未知键、字段值（按该字段顺序），二者均为规范 quantity（`0x` 前缀、无前导零、不超过 32 字节），且为不超过 `2**64 - 1` 的正整数（`0x0` 非法）。错误码为 `E_BATCH_POLICY_INVALID_FIELD`（根非对象或值非法）、`E_BATCH_POLICY_MISSING_FIELD`（缺键）、`E_BATCH_POLICY_UNKNOWN_FIELD`（未知键）；根 path 为 `/batchPolicy`，字段 path 为 `/batchPolicy/<字段>`。
+
+校验通过后，approved 请求按原下标组成不超过 `maxBatchCount` 个**非空**批次：把入选项按候选顺序切成有序段，被跳过（未入选）的请求既不占段也不强制另起一批；允许在任意两个相邻入选项之间主动另起一批。每批入选项数不超过 `maxOperationsPerBatch`，且每批独立满足 `bundlePolicy.maxTotalGas` 与 `bundlePolicy.maxCostWei`。同一 sender 跨全部批次的入选项总 `totalGas` 与总 `estimatedCostWei`（计入 `senderUsage`）不超过 `senderBudgetPolicy` 两条聚合限额。nonce 以 `senderNonceState` 为锚点：每个 (sender, nonceKey) 组的入选 sequence 跨批次从 `lastSequence + 1`（无状态时从 0）开始按候选下标递增连续相差 1，**跨批不重置**。
+
+最优方案的优先级依次为：最大化入选数；最小化批次数；最大化不同 sender 数；减小全部入选项总 `totalGas`；减小全部入选项总 `estimatedCostWei`；取扁平入选下标序列字典序最小的唯一方案。
+
+成功结果顶层键固定为 `ok`、`plan`、`nextSenderUsage`、`nextSenderNonceState`：
+
+- `plan` 沿用 `plan_bundle` 的汇总字段：`selected`（全部入选项原下标，升序）、`skipped`（按原下标升序，元素含 `index` 与 `reason`）、`operationCount`、`totalGas`、`estimatedCostWei`（均为十进制字符串），另含 `batches`。
+- `plan.batches` 为按批次顺序排列的非空批次数组，每项含 `index`（从 0 起）、`selected`（该批原下标，按候选顺序）、`operationCount`、`totalGas`、`estimatedCostWei`。
+- `skipped` 对每个未入选项只给一个原因：未代付请求沿用其 `E_GAS_LIMIT` 或 `E_BUDGET`；已批准但未入选的请求一律记 `E_NOT_SELECTED`。
+- `nextSenderUsage` 与 `nextSenderNonceState` 按 `advance_batch_state` 的同一规则对**全部入选项**结转（保留输入 sender/nonceKey、按规范小写地址与数值升序、数值为无前导零十进制字符串）。
+
+空请求、空选择（`batches` 为 `[]`）均为成功结果。命令行为 `python -m paymaster.batch_sequence`，从标准输入读 JSON、只向标准输出写一个 JSON 文档，成功退出 0、失败退出 1；标准输入不是合法 JSON 时输出 `E_INVALID_JSON` 结果（path 为空），其余结构错误沿用既有错误结果。
 
 
 ## 测试
