@@ -24,6 +24,8 @@
   批次 sender 累计用量的 sender 预算批量打包规划。
 - `paymaster.packing.plan_bundle_sender_budget_with_nonce_state(document)`
   叠加跨批次 sender 累计用量与 nonce 状态的 sender 预算批量打包规划。
+- `paymaster.batch_state.advance_batch_state(document)` 在该规划基线上把本批
+  入选结果结转为下一批的 sender 累计用量与 nonce 状态。
 """
 
 from paymaster.packing import (
