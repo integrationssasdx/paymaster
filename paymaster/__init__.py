@@ -31,6 +31,9 @@
 - `paymaster.batch_sequence_sender_fair.plan_batch_sequence_sender_fair(document)`
   sender 分批公平的多批次打包规划：在七字段文档上增加 fairnessPolicy，每个
   bundle 内同一 sender 至多 maxPerSenderPerBatch 项。
+- `paymaster.batch_sequence_global_budget.plan_batch_sequence_global_budget(document)`
+  全局预算的多批次打包规划：在七字段文档上增加 sequenceBudgetPolicy，全部
+  入选项的 totalGas 与 estimatedCostWei 总量分别不超两条上限。
 """
 
 from paymaster.packing import (
@@ -64,6 +67,7 @@ __all__ = [
     "advance_batch_state",
     "plan_batch_sequence",
     "plan_batch_sequence_sender_fair",
+    "plan_batch_sequence_global_budget",
 ]
 
 
@@ -84,6 +88,12 @@ def __getattr__(name: str):
         )
 
         return plan_batch_sequence_sender_fair
+    if name == "plan_batch_sequence_global_budget":
+        from paymaster.batch_sequence_global_budget import (
+            plan_batch_sequence_global_budget,
+        )
+
+        return plan_batch_sequence_global_budget
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
